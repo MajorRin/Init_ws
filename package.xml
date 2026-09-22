@@ -17,6 +17,10 @@
   <author email="zhangji@cmu.edu">Ji Zhang</author>
   
   <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>libgoogle-glog-dev</build_depend>
+  <run_depend>libgoogle-glog-dev</run_depend>
+  <run_depend>python3-numpy</run_depend>
+  <run_depend>python3-matplotlib</run_depend>
   <build_depend>geometry_msgs</build_depend>
   <build_depend>nav_msgs</build_depend>
   <build_depend>roscpp</build_depend>

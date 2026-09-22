@@ -28,7 +28,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 
-#define FILE_DIR(name)     (string(string(ROOT_DIR) + "Log/"+ name))
+#define FILE_DIR(name)     DEBUG_FILE_DIR(name)
 
 namespace plt = matplotlibcpp;
 using namespace std;
@@ -68,6 +68,18 @@ public:
     bool Data_processing_fished = false;
     deque<CalibState> system_state;
 
+
+    // Optional observer: arguments are borrowed only for the duration of the call.
+    struct SolveObserver {
+        virtual ~SolveObserver() = default;
+        virtual void solved(const char* stage, int refinement,
+            const Eigen::MatrixXd& matrix, const Eigen::VectorXd& rhs,
+            const Eigen::VectorXd& solution, const Eigen::Vector3d& gravity,
+            Eigen::ComputationInfo decomposition, Eigen::ComputationInfo solve) = 0;
+    };
+    SolveObserver* solve_observer = nullptr;
+    double solve_diagnostic_ms = 0;
+    bool debug_dump_matrices = false;
 
     Dynamic_init();
 
@@ -109,7 +121,7 @@ private:
     V3D gyro_bias;                // gyro bias
     V3D acc_bias;                 // acc bias
     V3D V_0;                           // initial velocity
-    double g_;
+    double g_;                    // m/s^2 
 };
 
 #endif

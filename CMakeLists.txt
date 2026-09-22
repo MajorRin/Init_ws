@@ -22,7 +22,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)" )
   message("Processer number:  ${N}")
   if(N GREATER 4)
     add_definitions(-DMP_EN)
-    add_definitions(-DMP_PROC_NUM=3)
+    add_definitions(-DMP_PROC_NUM=2)
     message("core for MP: 3")
   elseif(N GREATER 3)
     add_definitions(-DMP_EN)
@@ -62,6 +62,8 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.8 REQUIRED)
 find_package(Ceres REQUIRED)
+find_path(GLOG_INCLUDE_DIR glog/logging.h REQUIRED)
+find_library(GLOG_LIBRARY glog REQUIRED)
 
 message(Eigen: ${EIGEN3_INCLUDE_DIR})
 
@@ -98,8 +100,8 @@ add_executable(lidar_imu_init
 
 add_dependencies(lidar_imu_init ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
-target_link_libraries(lidar_imu_init ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${CERES_LIBRARIES} Sophus::Sophus tsl::robin_map)
-target_include_directories(lidar_imu_init PRIVATE ${PYTHON_INCLUDE_DIRS})
+target_link_libraries(lidar_imu_init ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} ${CERES_LIBRARIES} ${GLOG_LIBRARY} Sophus::Sophus tsl::robin_map)
+target_include_directories(lidar_imu_init PRIVATE ${PYTHON_INCLUDE_DIRS} ${GLOG_INCLUDE_DIR})
 
 
 

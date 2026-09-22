@@ -10,19 +10,18 @@ preprocess:
 
 initialization:
     cut_frame: true
-    cut_frame_num: 3           # must be positive integer
-    cut_frame_init_num: 5       # 如果分帧的话 从第几帧开始分帧 默认固态 5 机械 20
+    cut_frame_num: 2           # must be positive integer
+    cut_frame_init_num: 5      # 如果分帧的话 从第几帧开始分帧 默认固态 5 机械 20
     orig_odom_freq: 10
-    mean_acc_norm: 9.805
+    mean_acc_norm: 1.00
     online_refine_time: 20
-    data_accum_length: 400
     Rot_LI_cov: [ 0.00005, 0.00005, 0.00005 ]
     Trans_LI_cov: [ 0.0001, 0.0001, 0.0001 ]
 
 mapping:
-    filter_size_surf: 0.05
-    filter_size_map: 0.15
-    gyr_cov: 0.0001             # lgo角速度噪声协方差
+    filter_size_surf: 0.3
+    filter_size_map: 0.3
+    gyr_cov: 0.001             # lgo角速度噪声协方差
     acc_cov: 1             # lgo线速度噪声协方差
     # gyr_cov: 50             # lo角速度噪声协方差
     # acc_cov: 2             # lo线速度噪声协方差
@@ -30,12 +29,12 @@ mapping:
     # acc_cov: 0.1             # lio线速度噪声协方差
     det_range: 450.0
     cov_lidar: 0.001
-    max_iteration: 20
+    max_iteration: 5
     max_undistort: 7
     cube_side_length: 2000
     b_acc_cov: 0.0001
     b_gyr_cov: 0.0001
-    # aviv
+    # avia
     extrinsic_T: [ 0.04165, 0.02326, -0.0284 ]
     extrinsic_R: [ 1, 0, 0,
                    0, 1, 0,

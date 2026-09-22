@@ -82,6 +82,7 @@ class ImuProcess
   double frame_end_time = 0.0;
   double dt = 0.0;
   bool   imu_need_init_ = true;
+  bool   last_propagated = false; // 初始化对比实验: 上一帧 Process 是否实际执行了状态传播
   V3D acc_0;
   V3D gyr_0;
   vector<GYR_> GYR_pose;
@@ -142,6 +143,9 @@ void ImuProcess::Reset()
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  // 修复: pass 切换缓存重放时, 残留的 last_lidar_end_time_ 会导致
+  // propagation_and_undist 中 IMU 时间戳全部早于该值而整段 continue
+  last_lidar_end_time_ = 0;
 }
 
 void ImuProcess::set_extrinsic(const V3D &transl, const M3D &rot)
@@ -481,7 +485,8 @@ void ImuProcess::propagation_and_undist(const MeasureGroup &meas, StatesGroup &s
   IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, state_inout.vel_end, state_inout.pos_end, state_inout.rot_end));
 
   /*** forward propagation at each imu point ***/
-  V3D acc_imu, angvel_avr, acc_avr, vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
+  // 修复: 防御性初始化, 避免循环被整段 continue 跳过后使用未初始化值(UB)计算 rot_end 产生 NaN
+  V3D acc_imu = Zero3d, angvel_avr = Zero3d, acc_avr = Zero3d, vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
   M3D R_imu(state_inout.rot_end);
   MD(DIM_STATE, DIM_STATE) F_x, cov_w;
   
@@ -605,11 +610,15 @@ void ImuProcess::propagation_and_undist(const MeasureGroup &meas, StatesGroup &s
 
 void ImuProcess::Process(const MeasureGroup &meas, StatesGroup &state, PointCloudXYZI::Ptr pcl_un_, V3D ba, V3D bg)
 {
+  // 初始化对比实验: 每帧复位传播标志, 仅在实际执行传播/前向传播时置 true
+  last_propagated = false;
   if(LGO_MODE){
     if(LO_MODE){
       Forward_propagation_without_imu(meas, state, *pcl_un_);
+      last_propagated = true;
     }else{
       Forward_propagation_with_imu(meas, state, *pcl_un_, ba, bg);
+      last_propagated = true;
     }
   }else{
     if (imu_en)
@@ -646,10 +655,12 @@ void ImuProcess::Process(const MeasureGroup &meas, StatesGroup &state, PointClou
         return;
       }
       propagation_and_undist(meas, state, *pcl_un_);
+      last_propagated = true;
     }
     else
     {
       Forward_propagation_with_imu(meas, state, *pcl_un_, ba, bg);
+      last_propagated = true;
     }
   }
 }

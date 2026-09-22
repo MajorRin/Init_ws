@@ -1254,14 +1254,29 @@ void KD_TREE::flatten(KD_TREE_NODE * root, PointVector &Storage, delete_point_st
     return;
 }
 
-void KD_TREE::delete_tree_nodes(KD_TREE_NODE ** root){ 
+void KD_TREE::delete_tree_nodes(KD_TREE_NODE ** root){
     if (*root == nullptr) return;
-    Push_Down(*root);    
+    // 清除后台重建指针: Rebuild_Ptr 指向本树内的节点槽位(如 &node->left_son_ptr),
+    // 树被释放后它即为悬垂指针; 重建线程随后解引用, 在父指针校验处
+    // throw "Error: Father ptr incompatible with current node" -> 无人捕获 ->
+    // std::terminate -> 节点 abort(动态初始化每轮末 delete 后必现)。
+    // 加锁同时保证"正在进行的重建"先跑完, 不会把树从重建线程脚下抽走。
+    // termination_flag 为真说明线程已 stop(析构路径: stop_thread() 先于本函数),
+    // 此时互斥量已被销毁, 不能再加锁。
+    // Rebuild_Ptr != nullptr 的前置判断只为省掉递归中对每个节点重复加锁:
+    // 本函数只由主线程调用, 而"把 Rebuild_Ptr 置为非空"也只发生在主线程(Update),
+    // 重建线程只会把它写成 nullptr, 故此处的空读是确定的, 不会漏清。
+    if (!termination_flag && Rebuild_Ptr != nullptr){
+        pthread_mutex_lock(&rebuild_ptr_mutex_lock);
+        Rebuild_Ptr = nullptr;
+        pthread_mutex_unlock(&rebuild_ptr_mutex_lock);
+    }
+    Push_Down(*root);
     delete_tree_nodes(&(*root)->left_son_ptr);
-    delete_tree_nodes(&(*root)->right_son_ptr);  
-    pthread_mutex_destroy( &(*root)->push_down_mutex_lock);              
+    delete_tree_nodes(&(*root)->right_son_ptr);
+    pthread_mutex_destroy( &(*root)->push_down_mutex_lock);
     delete *root;
-    *root = nullptr;                    
+    *root = nullptr;
 
     return;
 }

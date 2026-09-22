@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include "IMU_Processing.hpp"
+#include "drift_diagnostics.h"
 #include "ros/package.h"
 #include <unistd.h>
 #include <Python.h>
@@ -47,11 +48,13 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <livox_ros_driver/CustomMsg.h>
+#include <geometry_msgs/Vector3Stamped.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 #include <Dynamic_init/Dynamic_init.h>
 
 #include <math.h>
+#include <cstdlib>   // 初始化对比实验: std::getenv
 #ifndef DEPLOY
 #include "matplotlibcpp.h"
 namespace plt = matplotlibcpp;
@@ -115,6 +118,38 @@ int cut_frame_num = 1, orig_odom_freq = 10, frame_num = 0;
 double time_lag_IMU_wtr_lidar = 0.0, move_start_time = 0.0, online_calib_starts_time = 0.0, mean_acc_norm = 9.81;
 ofstream time_result;
 double cov_lidar = 0.001;
+
+// ================= 数据分析: RTK速度缓存 (geometry_msgs/Vector3Stamped, m/s) =================
+mutex mtx_rtk;
+deque<pair<double, V3D>> rtk_buf;   // (时间戳, 速度)
+string rtk_topic = "/dji_osdk_ros/rtk_velocity";
+
+void rtk_velocity_cbk(const geometry_msgs::Vector3Stamped::ConstPtr &msg_in)
+{
+    double t = msg_in->header.stamp.toSec();
+    if (t <= 0) t = ros::Time::now().toSec();
+    V3D v(msg_in->vector.x, msg_in->vector.y, msg_in->vector.z);
+    std::lock_guard<mutex> lock(mtx_rtk);
+    rtk_buf.push_back(make_pair(t, v));
+    if (rtk_buf.size() > 20000) rtk_buf.pop_front();
+}
+
+// 取与指定时刻最近的RTK速度样本, 无数据返回false
+bool get_rtk_at(double t_query, double &rtk_t, V3D &rtk_v)
+{
+    std::lock_guard<mutex> lock(mtx_rtk);
+    if (rtk_buf.empty()) return false;
+    size_t best_i = 0;
+    double best_dt = fabs(rtk_buf.front().first - t_query);
+    for (size_t i = 1; i < rtk_buf.size(); i++)
+    {
+        double dt = fabs(rtk_buf[i].first - t_query);
+        if (dt < best_dt) { best_dt = dt; best_i = i; }
+    }
+    rtk_t = rtk_buf[best_i].first;
+    rtk_v = rtk_buf[best_i].second;
+    return true;
+}
 
 /// 前向传播自适应噪声参数
 bool adaptive_cov = false;
@@ -188,6 +223,9 @@ V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 double Last_g;
 double current_g;
+// 论文式(21)收敛判据: 相邻两次迭代的初速度向量差范数 ||v0^(i) - v0^(i-1)|| < Iteration_v
+V3D Last_v = V3D::Zero();    // 上一轮迭代解出的初速度
+V3D current_v = V3D::Zero(); // 本轮迭代解出的初速度
 
 //estimator inputs and output;
 MeasureGroup Measures;
@@ -404,7 +442,7 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         printf("Self sync IMU and LiDAR, HARD time lag is %.10lf \n \n", timediff_imu_wrt_lidar);
     }
 
-    if (cut_frame)
+    if (cut_frame && !dynamic_init->dynamic_init_fished)
     {
         deque<PointCloudXYZI::Ptr> ptr;
         deque<double> timestamp_lidar;
@@ -851,8 +889,8 @@ void iterCurrentPoint3D(Point3D& current_point, bool converge)
         double scale = offset_time / current_dt;
         scale = scale >= 1 ? 1 : scale <= 0 ? 0 : scale;
         // T_wj = inter(T_wb, T_we)   T_ej = T_ew * T_wj   P_e = T_ej * P_j  P_w = T_wj * P_j
-        Sophus::SE3d T_j = Sophus::interpolate(T_begin, T_end, scale);
-        Sophus::SE3d T_ej = T_end.inverse() * T_j;
+        Sophus::SE3d T_j = Sophus::interpolate(T_begin, T_end, scale);  // 根据当前时间，插值得到当前时间的变换矩阵T_j
+        Sophus::SE3d T_ej = T_end.inverse() * T_j;  // 计算当前时间点到帧末时间点的变换矩阵T_ej
         if(LO_MODE){
             current_point.undistort_lidar_point = T_ej * current_point.raw_point;
         }else{
@@ -1205,6 +1243,24 @@ int main(int argc, char **argv)
 {
     ros::init(argc, argv, "D_Li_init");
     ros::NodeHandle nh;
+    bool diagnostics_enabled = false;
+    std::string diagnostics_dir;
+    nh.param<bool>("diagnostics/enabled", diagnostics_enabled, false);
+    nh.param<std::string>("diagnostics/glog_dir", diagnostics_dir, "/tmp");
+    if (diagnostics_enabled) {
+        if (access(diagnostics_dir.c_str(), W_OK | X_OK) != 0) {
+            ROS_FATAL("Diagnostic directory is not writable: %s", diagnostics_dir.c_str());
+            return 1;
+        }
+        FLAGS_log_dir = diagnostics_dir;
+        FLAGS_logbufsecs = 1;
+        FLAGS_max_log_size = 256;
+        FLAGS_stop_logging_if_full_disk = true;
+        google::InitGoogleLogging(argv[0]);
+        drift_diag::event("startup", 0, "world_IMU_pose_wxyz_cov_order_R_P_RLI_TLI_V_BG_BA_G");
+    }
+    double diagnostics_processed = 0;
+    auto diagnostics_heartbeat = std::chrono::steady_clock::now();
 
     nh.param<int>("mapping/max_iteration", NUM_MAX_ITERATIONS, 10);
     nh.param<int>("mapping/max_undistort", NUM_MAX_UNDISTORT, 3);
@@ -1289,14 +1345,52 @@ int main(int argc, char **argv)
     last_state = state;
 
     /*** debug record ***/
-    boost::filesystem::create_directories(root_dir + "/Log");
+    boost::filesystem::create_directories(diagnostic_log_directory());
     boost::filesystem::create_directories(root_dir + "/result");
     ofstream Li_D_init_fastlio;
     Li_D_init_fastlio.open(DEBUG_FILE_DIR("Li_D_init_fastlio.txt"), ios::out);
 
-    time_result.open(root_dir + "/Log/time_log.txt", std::ios::out);
+    ofstream Li_D_init_iter_time;
+    Li_D_init_iter_time.open(DEBUG_FILE_DIR("Li_D_init_iter_time.txt"), ios::out);
+    Li_D_init_iter_time << "# pass_id solve_ms pass_total_ms delta_g converged" << endl;
+
+    ofstream Li_D_init_lio_time;
+    Li_D_init_lio_time.open(DEBUG_FILE_DIR("Li_D_init_lio_time.txt"), ios::out);
+    Li_D_init_lio_time << "# time frame_total_ms imu_ms downfilter_ms icp_ms knn_ms solve_ms map_increment_ms t_wall_ms effect_feat_num feats_down_size feats_full_size" << endl;
+
+    ofstream Li_D_init_frame_time;
+    Li_D_init_frame_time.open(DEBUG_FILE_DIR("Li_D_init_frame_time.txt"), ios::out);
+    Li_D_init_frame_time << "# t t_wall_ms frame_id pass_id measures_num row_type imu_en frame_total_ms"
+        " imu_ms downfilter_ms icp_ms knn_ms solve_ms publish_odom_ms map_inc_ms publish_tail_ms"
+        " iter_count knn_count rematch_num effect_feat_num feats_down_size feats_full_size"
+        " kdtree_size_st kdtree_size_end res_mean_last build_ms" << endl;
+    Li_D_init_frame_time << std::fixed << std::setprecision(6);
+
+    ofstream Li_D_init_lag;
+    Li_D_init_lag.open(DEBUG_FILE_DIR("Li_D_init_lag.txt"), ios::out);
+    Li_D_init_lag << "# t_frame t_sim_now lag_ms pass_id converged" << endl;
+    Li_D_init_lag << std::fixed << std::setprecision(6);
+
+    time_result.open(DEBUG_FILE_DIR("time_log.txt"), std::ios::out);
     time_result.precision(9);
     time_result.setf(std::ios::fixed);
+
+
+    std::string cmp_dir = std::getenv("INIT_CMP_DIR") ? std::getenv("INIT_CMP_DIR")
+                        : root_dir + "/Log/init_comparison/default";
+    boost::filesystem::create_directories(cmp_dir);
+    ofstream cmp_events, cmp_states;
+    cmp_events.open(cmp_dir + "/A_events.log", ios::out);
+    cmp_states.open(cmp_dir + "/A_states.log", ios::out);
+    cmp_events << "# record_type t ..." << endl;
+    cmp_events << "# init_done t reason(=converged|max_iter) vel(3) bg(3) grav(3) pos(3) vel_prop(3) bg_prop(3) grav_prop(3)" << endl;
+    cmp_events << "# batch_solution t_first V0(3) V0_imu(3) gyro_bias(3) Grav_L0(3) grav_imu(3)" << endl;
+    cmp_events << "# first_post t vel(3) bg(3) grav(3)" << endl;
+    cmp_events << std::fixed << std::setprecision(9);
+    cmp_states << "# t_state record_type applied cov_committed propagated flg_EKF_inited imu_en effect_feat_num vel(3) bg(3) grav(3)" << endl;
+    cmp_states << std::fixed << std::setprecision(9);
+    bool cmp_applied = false, cmp_cov_committed = false, cmp_propagated = false;
+    bool cmp_first_post_written = false;
 
     if (Li_D_init_fastlio && time_result)
         cout << "~~~~" << ROOT_DIR << " file opened" << endl;
@@ -1314,6 +1408,11 @@ int main(int argc, char **argv)
     ros::Subscriber sub_imu = nh.subscribe<sensor_msgs::Imu>
             (imu_topic, 200000, boost::bind(&imu_cbk, _1, pubIMU_sync));
 
+    // 数据分析: 订阅RTK速度 (geometry_msgs/Vector3Stamped, m/s), 随速度日志一同记录
+    nh.param<string>("common/rtk_vel_topic", rtk_topic, "/dji_osdk_ros/rtk_velocity");
+    ros::Subscriber sub_rtk = nh.subscribe<geometry_msgs::Vector3Stamped>
+            (rtk_topic, 200000, rtk_velocity_cbk);
+
 
     ros::Publisher pubLaserCloudFullRes = nh.advertise<sensor_msgs::PointCloud2>
             ("/lidar_init_cloud_registered", 100000);
@@ -1329,36 +1428,55 @@ int main(int argc, char **argv)
             ("/lidar_init_path", 100000);
     int Iteration_NUM;
     double Iteration;
+    // 论文式(21): 初速度变化量阈值 Γv (m/s), 收敛判据 ||v0^(i)-v0^(i-1)|| < Iteration_v
+    double Iteration_v = 0.1;
     double d_init_solve_time = 0;
     double sum_d_init_solve_time = 0;
+    // 数据分析标记列: 0=动态初始化完成前, 1=初始化完成时刻(写入V_0初值行), 2=初始化完成后
+    int init_frame_flag = 0;
+    // 数据分析: 动态初始化迭代计时
+    std::chrono::steady_clock::time_point t_pass_begin = std::chrono::steady_clock::now();
+    int pass_id = 0;
     nh.getParam("/Iteration_NUM", Iteration_NUM);
     nh.getParam("/Data_accum_length", dynamic_init->data_accum_length);
     nh.getParam("/Iteration", Iteration);
+    nh.getParam("/Iteration_v", Iteration_v);
     nh.getParam("/LGO_MODE", LGO_MODE);
     nh.getParam("/LO_MODE", LO_MODE);
     nh.getParam("/LIO_MODE", LIO_MODE);
     p_imu->LGO_MODE = LGO_MODE;
     p_imu->LO_MODE = LO_MODE;
     p_imu->LIO_MODE = LIO_MODE;
+    // 如果 LIO = 0，则认为初始化完成，直接进入 LIO 模式
     if(LIO_MODE){
         dynamic_init->dynamic_init_fished = true;
         dynamic_init->Data_processing_fished = true;
         p_imu->Dynamic_init_done = false;
         imu_en = true;
         p_imu->imu_en = imu_en;
+        init_frame_flag = 2;  // LIO_MODE直接跳过动态初始化,无初始化时刻标记
     }
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
+    // Diagnostic replay must keep draining after rosbag stops publishing /clock.
+    ros::WallRate diagnostics_rate(5000);
     bool status = ros::ok();
     int frame_id = 0;
     int iteration_num = 0;
     int measures_num = -1;
     bool data_alignment = 0;
+    std::chrono::steady_clock::time_point t_program_begin = std::chrono::steady_clock::now();
     while (status)
     {
         if (flg_exit) break;
         ros::spinOnce();
+        if (diagnostics_enabled && drift_diag::elapsed(diagnostics_heartbeat) >= 1000) {
+            drift_diag::heartbeat(dynamic_init->dynamic_init_fished, lidar_buffer.size(),
+                                  imu_buffer.size(), last_timestamp_lidar,
+                                  diagnostics_processed, last_timestamp_imu);
+            diagnostics_heartbeat = std::chrono::steady_clock::now();
+        }
         if(!LGO_MODE){
             if(!dynamic_init->Data_processing_fished){
                 if(sync_packages(Measures)){
@@ -1373,6 +1491,7 @@ int main(int argc, char **argv)
                     {
                         dynamic_init->Data_processing_fished = true;
                         dynamic_init->lidar_frame_count = 0;
+                        t_pass_begin = std::chrono::steady_clock::now();
                     }else{
                         continue;
                     }
@@ -1380,7 +1499,11 @@ int main(int argc, char **argv)
             }
             if(dynamic_init->Data_processing_fished && !dynamic_init->dynamic_init_fished){
                 measures_num = measures_num + 1;
-                if( measures_num == dynamic_init->data_accum_length) measures_num = 0;
+                if( measures_num == dynamic_init->data_accum_length)
+                {
+                    measures_num = 0;
+                    t_pass_begin = std::chrono::steady_clock::now();
+                }
                 Measures = dynamic_init->Initialized_data[measures_num];
                 data_alignment = 1;
             } else {
@@ -1400,6 +1523,16 @@ int main(int argc, char **argv)
         {
             lidar_end_time = Measures.lidar_end_time;
             frame_id++;
+            if (diagnostics_enabled) drift_diag::context().pass_id = pass_id;
+            drift_diag::Frame diagnostic(diagnostics_enabled,
+                                         state, frame_id, lidar_end_time,
+                                         LIO_MODE ? "direct_lio" : (dynamic_init->dynamic_init_fished
+                                         ? "post_dynamic" : (Iteration_begin ? "cache_reprocess" : "initial_lgo")));
+            if (diagnostic.enabled) {
+                diagnostics_processed = lidar_end_time;
+                diagnostic.cache_index = dynamic_init->dynamic_init_fished ? -1 : measures_num;
+                diagnostic.raw_points = Measures.lidar ? Measures.lidar->size() : 0;
+            }
             data_alignment = 0;
             std::chrono::steady_clock::time_point t_imu_process_begin = std::chrono::steady_clock::now();
 
@@ -1417,13 +1550,39 @@ int main(int argc, char **argv)
             //     pcl::io::savePCDFile(filenameyuanshi, *(cloudyuanshi));
             // }
 
+            // 前向传播与点云畸变校正
+            // 初始化对比实验: 记录本帧传播/应用/协方差提交标志, Process 前复位
+            cmp_applied = false;
+            cmp_cov_committed = false;
+            cmp_propagated = false;
             p_imu->Process(Measures, state, feats_undistort, dynamic_init->get_acc_bias(), dynamic_init->get_gyro_bias());
+            cmp_propagated = p_imu->last_propagated;
+            diagnostic.propagated = cmp_propagated;
+            diagnostic.prediction(state);
+            if (diagnostic.enabled) {
+                diagnostic.undistorted_points = feats_undistort ? feats_undistort->size() : 0;
+                diagnostic.imu_ms = drift_diag::elapsed(t_imu_process_begin);
+            }
+            diagnostic.reason = "empty_cloud";
 
             if (feats_undistort->empty() || (feats_undistort == NULL))
             {
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
                 ROS_WARN("First frame, no points stored.");
+                if(!dynamic_init->dynamic_init_fished){
+                    std::chrono::steady_clock::time_point t_frame_skip = std::chrono::steady_clock::now();
+                    Li_D_init_frame_time << lidar_end_time << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_frame_skip - t_program_begin).count() * 1000 << " "
+                        << frame_id << " " << pass_id << " " << measures_num << " " << 2 << " " << (int)imu_en << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_frame_skip - t_imu_process_begin).count() * 1000 << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_frame_skip - t_imu_process_begin).count() * 1000 << " "
+                        << -1 << " " << -1 << " " << -1 << " " << -1 << " " << -1 << " "
+                        << -1 << " " << -1 << " " << -1 << " "
+                        << -1 << " " << -1 << " " << -1 << " " << -1 << " "
+                        << -1 << " " << -1 << " " << -1 << " " << -1 << " " << -1 << endl;
+                }
+                diagnostic.finish(state);
                 continue;
             }
             // if(frame_id < dynamic_init->data_accum_length){
@@ -1434,9 +1593,10 @@ int main(int argc, char **argv)
             //     std::string filenamequjibian = "/home/myx/fighting/LGO_WS/src/LiDAR_DYNAMIC_INIT/pcb/qujibian/qujibian"+ std::to_string(frame_id)+ ".pcd";
             //     pcl::io::savePCDFile(filenamequjibian, *(cloudshowqujibian));
             // }
-
+            
+            // 将畸变校正后的点云转换为Point3D格式
             feats_points = PCLtoPoint3D(feats_undistort, RAW);
-            current_dt = p_imu->frame_dt;
+            current_dt = p_imu->frame_dt;   // p_imu->frame_dt; 为当前帧雷达数据的时间间隔
             current_end_time = p_imu->frame_end_time;
 
             state_propagat = state;
@@ -1462,6 +1622,8 @@ int main(int argc, char **argv)
             std::chrono::steady_clock::time_point t_downfilter_end = std::chrono::steady_clock::now();
             /// 初始化第一帧点使用未下采样的点
             /*** initialize the map kdtree ***/
+            diagnostic.reason = "map_seed";
+            diagnostic.points = feats_points_size;
             if (ikdtree.Root_Node == nullptr )
             {
                 if (feats_points_size > 5)
@@ -1487,288 +1649,323 @@ int main(int argc, char **argv)
                         dynamic_init->system_state[measures_num].T = state.pos_end;
                     }
                 }
+                if(!dynamic_init->dynamic_init_fished){
+                    std::chrono::steady_clock::time_point t_frame_skip = std::chrono::steady_clock::now();
+                    Li_D_init_frame_time << lidar_end_time << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_frame_skip - t_program_begin).count() * 1000 << " "
+                        << frame_id << " " << pass_id << " " << measures_num << " " << 1 << " " << (int)imu_en << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_frame_skip - t_imu_process_begin).count() * 1000 << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_imu_process_end - t_imu_process_begin).count() * 1000 << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_downfilter_end - t_downfilter_begin).count() * 1000 << " "
+                        << -1 << " " << -1 << " " << -1 << " " << -1 << " " << -1 << " " << -1 << " "
+                        << -1 << " " << -1 << " " << -1 << " " << -1 << " "
+                        << feats_points_size << " " << feats_points_full_size << " "
+                        << -1 << " " << -1 << " " << -1 << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(t_frame_skip - t_downfilter_end).count() * 1000 << endl;
+                }
+                diagnostic.finish(state);
                 continue;
             }
-            int featsFromMapNum = ikdtree.validnum();
-            kdtree_size_st = ikdtree.size();
+            int featsFromMapNum = ikdtree.validnum(); // 获取ikdtree中有效点数（地图点数）
+            kdtree_size_st = ikdtree.size(); // 获取ikdtree总大小（含被删节点）
             /*** ICP and iterated Kalman filter update ***/
-            normvec->resize(feats_points_size);
-            feats_down_world->resize(feats_points_size);
-            euler_cur = RotMtoEuler(state.rot_end);
+            normvec->resize(feats_points_size); // 法向量点云调整大小=降采样后点数
+            feats_down_world->resize(feats_points_size); // 世界系下点云调整大小=降采样后点数
+            euler_cur = RotMtoEuler(state.rot_end); // 当前旋转矩阵→欧拉角，用于后续发布
 
-            pointSearchInd_surf.resize(feats_points_size);
-            Nearest_Points.resize(feats_points_size);
-            int rematch_num = 0;
-            bool nearest_search_en = true;
+            pointSearchInd_surf.resize(feats_points_size); // 最近邻索引数组调整大小
+            Nearest_Points.resize(feats_points_size); // 最近邻点集数组调整大小
+            int rematch_num = 0; // 重匹配次数计数器（收敛后重新搜索近邻的次数）
+            bool nearest_search_en = true; // 是否启用最近邻搜索标志，首轮必须搜索
 
             /*** iterated state estimation ***/
-            std::vector<M3D> body_var;
-            std::vector<M3D> crossmat_list;
-            body_var.reserve(feats_points_size);
-            crossmat_list.reserve(feats_points_size);
+            std::vector<M3D> body_var; // 预分配：每个点在体坐标系下的协方差矩阵
+            std::vector<M3D> crossmat_list; // 预分配：每个点的反对称矩阵列表
+            body_var.reserve(feats_points_size); // 预留空间避免重复分配
+            crossmat_list.reserve(feats_points_size); // 预留空间避免重复分配
 
-            std::chrono::steady_clock::time_point icp_begin = std::chrono::steady_clock::now();
+            std::chrono::steady_clock::time_point icp_begin = std::chrono::steady_clock::now(); // ICP总计时起点
 
-            double knn_time = 0;
-            double solve_time = 0;
+            double knn_time = 0; // KNN搜索累计耗时（秒）
+            double solve_time = 0; // 状态求解累计耗时（秒）
 
-            int knn_count = 0;
-            int iter_count = 0;
-            StatesGroup last_converge_state = state;
+            int knn_count = 0; // KNN搜索次数计数
+            int iter_count = 0; // 总迭代次数计数
+            StatesGroup last_converge_state = state; // 上一次收敛时的状态（用于LGO全局收敛判断）
 
-            bool current_converge = true;
-            int current_iter_count = 0;
+            bool current_converge = true; // 当前迭代是否已收敛（初始true让第一轮distort_time++）
+            int current_iter_count = 0; // 当前收敛轮内的迭代计数（用于LGO判断是否该重新去畸变）
 
-            distort_time = 0;
+            distort_time = 0; // 去畸变次数计数器（LGO模式下限制去畸变-ICP循环次数）
 
-            for (iterCount = 0; iterCount < NUM_MAX_ITERATIONS; iterCount++)
+            int lio_converge_count = 0; // LIO模式收敛确认计数
+
+            for (iterCount = 0; iterCount < NUM_MAX_ITERATIONS; iterCount++) // 迭代EKF主循环，最多NUM_MAX_ITERATIONS次（默认10）
             {
-                laserCloudOri->clear();
-                corr_normvect->clear();
-                total_residual = 0.0;
+                laserCloudOri->clear(); // 清空：有效特征点的原始坐标（体坐标系）
+                corr_normvect->clear(); // 清空：有效特征点对应的法向量+残差
+                total_residual = 0.0; // 清零：总残差
 
-                iter_count++;
+                iter_count++; // 总迭代计数+1
 
-                if (nearest_search_en)
-                    knn_count++;
+                if (nearest_search_en) // 如果本轮需要重新搜索最近邻
+                    knn_count++; // KNN搜索计数+1
 
-                if (current_converge)
-                    distort_time++;
+                if (current_converge) // 如果上一轮已收敛（需要重新去畸变）
+                    distort_time++; // 去畸变次数+1
 
-                std::chrono::steady_clock::time_point knn_begin = std::chrono::steady_clock::now();
+                std::chrono::steady_clock::time_point knn_begin = std::chrono::steady_clock::now(); // KNN计时起点
 
                 /** closest surface search and residual computation **/
-                #ifdef MP_EN
-                    omp_set_num_threads(MP_PROC_NUM);
-                    #pragma omp parallel for
+                #ifdef MP_EN // 如果启用了OpenMP多线程
+                    omp_set_num_threads(MP_PROC_NUM); // 设置线程数
+                    #pragma omp parallel for // 并行化下面的for循环
                 #endif
-                for (int i = 0; i < feats_points_size; i++)
+                for (int i = 0; i < feats_points_size; i++) // 遍历每个降采样后的点
                 {
-                    PointType point_body;
-                    PointType point_world;
-                    if(imu_en){
-                        point_body = feats_down_body->points[i];
-                        point_world = feats_down_world->points[i];
+                    PointType point_body; // 体坐标系下的点（LiDAR系或IMU系）
+                    PointType point_world; // 世界坐标系下的点
+                    if(imu_en){ // LIO模式
+                        point_body = feats_down_body->points[i]; // 取降采样后体坐标系点
+                        point_world = feats_down_world->points[i]; // 取世界系点（上一轮的，会被覆盖）
                         /// transform to world frame
-                        pointBodyToWorld(&point_body, &point_world);
-                    } else {
+                        pointBodyToWorld(&point_body, &point_world); // 用当前状态将体坐标系点变换到世界系：p_w = R·(R_LI·p_L + T_LI) + T
+                    } else { // LGO/LO模式
                         // 去畸变 计算世界坐标系下的点
-                        iterCurrentPoint3D(feats_points[i], current_converge);
+                        iterCurrentPoint3D(feats_points[i], current_converge); // 用当前状态对Point3D做去畸变+世界变换（迭代中状态更新后需重新计算）
                         // 去畸变后的点
-                        point_body = point3DtoPCLPoint(feats_points[i], UNDISTORT);
-                        point_world = point3DtoPCLPoint(feats_points[i], WORLD);
+                        point_body = point3DtoPCLPoint(feats_points[i], UNDISTORT); // 取去畸变后的体坐标系点
+                        point_world = point3DtoPCLPoint(feats_points[i], WORLD); // 取世界坐标系下的点
                     }
-                    V3D p_body(point_body.x, point_body.y, point_body.z);
-                    vector<float> pointSearchSqDis(NUM_MATCH_POINTS);
-                    auto &points_near = Nearest_Points[i];
-                    uint8_t search_flag = 0;
+                    V3D p_body(point_body.x, point_body.y, point_body.z); // 转为Eigen向量，用于后续计算
+                    vector<float> pointSearchSqDis(NUM_MATCH_POINTS); // 最近邻搜索距离平方结果（NUM_MATCH_POINTS=5）
+                    auto &points_near = Nearest_Points[i]; // 引用：第i个点的最近邻点集
+                    uint8_t search_flag = 0; // 搜索标志（未使用）
 
-                    if (nearest_search_en)
+                    if (nearest_search_en) // 如果本轮需要重新搜索最近邻
                     {
                         /** Find the closest surfaces in the map **/
-                        ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis, 5);
-                        if (points_near.size() < NUM_MATCH_POINTS)
-                            point_selected_surf[i] = false;
+                        ikdtree.Nearest_Search(point_world, NUM_MATCH_POINTS, points_near, pointSearchSqDis, 5); // 在ikdtree中搜索5个最近邻点
+                        if (points_near.size() < NUM_MATCH_POINTS) // 如果找到的近邻不足5个
+                            point_selected_surf[i] = false; // 标记该点无效（不参与配准）
                         else
-                            point_selected_surf[i] = !(pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5);
+                            point_selected_surf[i] = !(pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5); // 第5近邻距离>√5则标记无效（点离地图太远）
                     }
 
-                    res_last[i] = -1000.0f;
+                    res_last[i] = -1000.0f; // 重置残差为无效值
 
-                    if (!point_selected_surf[i] || points_near.size() < NUM_MATCH_POINTS)
+                    if (!point_selected_surf[i] || points_near.size() < NUM_MATCH_POINTS) // 如果该点无效或近邻不足
                     {
-                        point_selected_surf[i] = false;
-                        continue;
+                        point_selected_surf[i] = false; // 确保标记为无效
+                        continue; // 跳过该点
                     }
 
-                    point_selected_surf[i] = false;
-                    VD(4) pabcd;
-                    pabcd.setZero();
-                    if (esti_plane(pabcd, points_near, 0.1)) //(planeValid)
+                    point_selected_surf[i] = false; // 先假设无效，下面验证通过再设为true
+                    VD(4) pabcd; // 平面方程系数 [a,b,c,d]，ax+by+cz+d=0
+                    pabcd.setZero(); // 初始化为零
+                    if (esti_plane(pabcd, points_near, 0.1)) // 用5个近邻点拟合局部平面，0.1为平面拟合阈值（SVD最小奇异值比）
                     {
                         float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z +
-                                    pabcd(3);
-                        float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+                                    pabcd(3); // 计算点到平面的有符号距离：pd2 = n·p_w + d
+                        float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm()); // 自适应权重：残差越小权重越大，p_body.norm()是点到原点距离
 
-                        if (s > 0.9) {
-                            point_selected_surf[i] = true;
-                            normvec->points[i].x = pabcd(0);
-                            normvec->points[i].y = pabcd(1);
-                            normvec->points[i].z = pabcd(2);
-                            normvec->points[i].intensity = pd2;
-                            res_last[i] = abs(pd2);
+                        if (s > 0.9) { // 如果权重足够大（残差足够小，说明点是有效的平面特征）
+                            point_selected_surf[i] = true; // 标记该点为有效特征点
+                            normvec->points[i].x = pabcd(0); // 存储平面法向量x分量
+                            normvec->points[i].y = pabcd(1); // 存储平面法向量y分量
+                            normvec->points[i].z = pabcd(2); // 存储平面法向量z分量
+                            normvec->points[i].intensity = pd2; // 存储点到面残差（有符号距离）
+                            res_last[i] = abs(pd2); // 存储绝对残差，用于后续残差监控
                         }
                     }
                 }
 
-                std::chrono::steady_clock::time_point knn_end = std::chrono::steady_clock::now();
-                knn_time += std::chrono::duration_cast<std::chrono::duration<double> >(knn_end - knn_begin).count();
+                std::chrono::steady_clock::time_point knn_end = std::chrono::steady_clock::now(); // KNN计时终点
+                knn_time += std::chrono::duration_cast<std::chrono::duration<double> >(knn_end - knn_begin).count(); // 累加KNN耗时
 
-                effect_feat_num = 0;
-                for (int i = 0; i < feats_points_size; i++)
+                effect_feat_num = 0; // 有效特征点计数清零
+                for (int i = 0; i < feats_points_size; i++) // 遍历所有降采样点
                 {
-                    if (point_selected_surf[i])
+                    if (point_selected_surf[i]) // 如果是有效特征点
                     {
-                        if(imu_en){
-                            laserCloudOri->points[effect_feat_num] = feats_down_body->points[i];
-                        }else{
-                            laserCloudOri->points[effect_feat_num] = point3DtoPCLPoint(feats_points[i], UNDISTORT);
+                        if(imu_en){ // LIO模式
+                            laserCloudOri->points[effect_feat_num] = feats_down_body->points[i]; // 存入体坐标系下的原始点
+                        }else{ // LGO/LO模式
+                            laserCloudOri->points[effect_feat_num] = point3DtoPCLPoint(feats_points[i], UNDISTORT); // 存入去畸变后的体坐标系点
                         }
-                        corr_normvect->points[effect_feat_num] = normvec->points[i];
-                        effect_feat_num++;
+                        corr_normvect->points[effect_feat_num] = normvec->points[i]; // 存入对应的法向量+残差
+                        effect_feat_num++; // 有效特征点计数+1
                     }
                 }
 
-                res_mean_last = total_residual / effect_feat_num;
+                res_mean_last = total_residual / effect_feat_num; // 计算平均残差（用于监控收敛）
 
                 /*** Computation of Measurement Jacobian matrix H and measurents vector ***/
 
-                MatrixXd Hsub(effect_feat_num, 12);
-                MatrixXd Hsub_T_R_inv(12, effect_feat_num);
-                VectorXd R_inv(effect_feat_num);
-                VectorXd meas_vec(effect_feat_num);
+                MatrixXd Hsub(effect_feat_num, 12); // 测量Jacobian矩阵：effect_feat_num行×12列（12=[δR,δT,δR_LI,δT_LI]各3维）
+                MatrixXd Hsub_T_R_inv(12, effect_feat_num); // H^T·R^{-1}：12行×effect_feat_num列，预计算加速后续矩阵运算
+                VectorXd R_inv(effect_feat_num); // 测量噪声逆矩阵对角线（标量×单位阵）
+                VectorXd meas_vec(effect_feat_num); // 测量残差向量：每个有效特征点的点到面距离
 
-                Hsub.setZero();
-                Hsub_T_R_inv.setZero();
-                meas_vec.setZero();
+                Hsub.setZero(); // H矩阵清零
+                Hsub_T_R_inv.setZero(); // H^T·R^{-1}清零
+                meas_vec.setZero(); // 测量向量清零
 
-                std::chrono::steady_clock::time_point solve_begin = std::chrono::steady_clock::now();
+                std::chrono::steady_clock::time_point solve_begin = std::chrono::steady_clock::now(); // 求解计时起点
 
-                for (int i = 0; i < effect_feat_num; i++)
+                for (int i = 0; i < effect_feat_num; i++) // 遍历每个有效特征点，构建H和测量向量
                 {
-                    const PointType &laser_p = laserCloudOri->points[i];
-                    V3D point_this_L(laser_p.x, laser_p.y, laser_p.z);
+                    const PointType &laser_p = laserCloudOri->points[i]; // 取第i个有效点的体坐标系坐标
+                    V3D point_this_L(laser_p.x, laser_p.y, laser_p.z); // 转为Eigen向量：LiDAR坐标系下的点p_L
 
-                    V3D point_this = state.offset_R_L_I * point_this_L + state.offset_T_L_I;
-                    M3D var;
-                    calcBodyVar(point_this, 0.02, 0.05, var);
-                    var = state.rot_end * var * state.rot_end.transpose();
-                    M3D point_crossmat;
-                    point_crossmat << SKEW_SYM_MATRX(point_this);
+                    V3D point_this = state.offset_R_L_I * point_this_L + state.offset_T_L_I; // 变换到IMU坐标系：p_I = R_L_I·p_L + T_L_I
+                    M3D var; // 点在IMU体坐标系下的协方差
+                    calcBodyVar(point_this, 0.02, 0.05, var); // 计算体坐标系协方差（基于点到原点距离的模型：近处0.02，远处0.05）
+                    var = state.rot_end * var * state.rot_end.transpose(); // 旋转到世界系：var_w = R·var·R^T
+                    M3D point_crossmat; // 点的反对称矩阵[p]_×
+                    point_crossmat << SKEW_SYM_MATRX(point_this); // 构造反对称矩阵，用于叉积：p×v = [p]_×·v
 
                     /*** get the normal vector of closest surface/corner ***/
-                    const PointType &norm_p = corr_normvect->points[i];
-                    V3D norm_vec(norm_p.x, norm_p.y, norm_p.z);
+                    const PointType &norm_p = corr_normvect->points[i]; // 取该点对应的法向量+残差
+                    V3D norm_vec(norm_p.x, norm_p.y, norm_p.z); // 提取法向量n（单位向量，指向平面）
 
-                    R_inv(i) = 1000;
-                    laserCloudOri->points[i].intensity = sqrt(R_inv(i));
+                    R_inv(i) = 1000; // 测量噪声逆=1000，即σ²=0.001（cov_lidar），R^{-1}=1/σ²
+                    laserCloudOri->points[i].intensity = sqrt(R_inv(i)); // 存储√(R^{-1})到intensity字段（用于可视化/调试）
 
                     /*** calculate the Measurement Jacobian matrix H ***/
-                    if (imu_en) {
-                        M3D point_this_L_cross;
-                        point_this_L_cross << SKEW_SYM_MATRX(point_this_L);
+                    if (imu_en) { // LIO模式：12维状态[δR,δT,δR_LI,δT_LI]
+                        M3D point_this_L_cross; // LiDAR系下点的反对称矩阵[p_L]_×
+                        point_this_L_cross << SKEW_SYM_MATRX(point_this_L); // 构造[p_L]_×
                         V3D H_R_LI = point_this_L_cross * state.offset_R_L_I.transpose() * state.rot_end.transpose() *
-                                     norm_vec;
-                        V3D H_T_LI = state.rot_end.transpose() * norm_vec;
-                        V3D A(point_crossmat * state.rot_end.transpose() * norm_vec);
+                                     norm_vec; // 对外参旋转R_L_I的Jacobian：∂z/∂δR_LI = [p_L]_×·R_L_I^T·R^T·n
+                        V3D H_T_LI = state.rot_end.transpose() * norm_vec; // 对外参平移T_L_I的Jacobian：∂z/∂δT_LI = R^T·n
+                        V3D A(point_crossmat * state.rot_end.transpose() * norm_vec); // 对旋转R的Jacobian主项：A = [p_I]_×·R^T·n
                         Hsub.row(i) << VEC_FROM_ARRAY(A), norm_p.x, norm_p.y, norm_p.z, VEC_FROM_ARRAY(
-                                H_R_LI), VEC_FROM_ARRAY(H_T_LI);
-                    } else {
-                        V3D A(point_crossmat * state.rot_end.transpose() * norm_vec);
-                        Hsub.row(i) << VEC_FROM_ARRAY(A), norm_p.x, norm_p.y, norm_p.z, 0, 0, 0, 0, 0, 0;
+                                H_R_LI), VEC_FROM_ARRAY(H_T_LI); // 拼接第i行H：[A, n, H_R_LI, H_T_LI]，共12列
+                    } else { // LGO/LO模式：仅6维状态[δR,δT]，外参Jacobian置零
+                        V3D A(point_crossmat * state.rot_end.transpose() * norm_vec); // 对旋转R的Jacobian：A = [p_I]_×·R^T·n
+                        Hsub.row(i) << VEC_FROM_ARRAY(A), norm_p.x, norm_p.y, norm_p.z, 0, 0, 0, 0, 0, 0; // 拼接第i行H：[A, n, 0,0,0,0,0,0]，后6列置零
                     }
 
-                    Hsub_T_R_inv.col(i) = Hsub.row(i).transpose() / cov_lidar;
+                    Hsub_T_R_inv.col(i) = Hsub.row(i).transpose() / cov_lidar; // 预计算H^T·R^{-1}的第i列 = H_i^T / σ²
                     /*** Measurement: distance to the closest surface/corner ***/
-                    meas_vec(i) = -norm_p.intensity;
+                    meas_vec(i) = -norm_p.intensity; // 测量残差 = -(点到面距离)，取负号因为EKF更新公式中z = h(x)-z_meas
                 }
 
-                MatrixXd K(DIM_STATE, effect_feat_num);
+                MatrixXd K(DIM_STATE, effect_feat_num); // 卡尔曼增益矩阵：DIM_STATE行×effect_feat_num列
 
-                EKF_stop_flg = false;
-                flg_EKF_converged = false;
-                current_converge = false;
+                EKF_stop_flg = false; // 重置EKF停止标志
+                flg_EKF_converged = false; // 重置EKF收敛标志
+                current_converge = false; // 重置当前收敛标志
                 /*** Iterative Kalman Filter Update ***/
 
-                H_T_H.block<12, 12>(0, 0) = Hsub_T_R_inv * Hsub;
-                MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + state.cov.inverse()).inverse();
-                K = K_1.block<DIM_STATE, 12>(0, 0) * Hsub_T_R_inv;
-                auto vec = state_propagat - state;
-                solution = K * meas_vec + vec - K * Hsub * vec.block<12, 1>(0, 0);
+                H_T_H.block<12, 12>(0, 0) = Hsub_T_R_inv * Hsub; // 计算 H^T·R^{-1}·H（12×12矩阵），只填充左上12×12块
+                MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + state.cov.inverse()).inverse(); // K_1 = (H^T·R^{-1}·H + P^{-1})^{-1}，即后验协方差
+                K = K_1.block<DIM_STATE, 12>(0, 0) * Hsub_T_R_inv; // 卡尔曼增益 K = P_posterior · H^T · R^{-1}，取K_1左上DIM_STATE×12块
+                auto vec = state_propagat - state; // IMU传播状态与当前EKF状态的差值（传播-更新），即"先验-后验"偏差
+                solution = K * meas_vec + vec - K * Hsub * vec.block<12, 1>(0, 0); // 状态修正量 = K·z + (x_prop-x) - K·H·(x_prop-x)_前12维
+                                                                                   // 第一项：测量更新；第二项：补偿传播偏差；第三项：减去测量已解释的偏差部分
 
                 //state update
-                state += solution;
+                state += solution; // 状态更新：state = state + δx（旋转用右乘更新，平移/速度等加法更新）
+                cmp_applied = true; // 初始化对比实验: 本帧滤波解已应用到状态
 
-                std::chrono::steady_clock::time_point solve_end = std::chrono::steady_clock::now();
+                std::chrono::steady_clock::time_point solve_end = std::chrono::steady_clock::now(); // 求解计时终点
 
-                solve_time += std::chrono::duration_cast<std::chrono::duration<double> >(solve_end - solve_begin).count();
+                solve_time += std::chrono::duration_cast<std::chrono::duration<double> >(solve_end - solve_begin).count(); // 累加求解耗时
 
-                rot_add = solution.block<3, 1>(0, 0);
-                T_add = solution.block<3, 1>(3, 0);
+                rot_add = solution.block<3, 1>(0, 0); // 提取旋转更新量δR（前3维）
+                T_add = solution.block<3, 1>(3, 0); // 提取平移更新量δT（第4-6维）
 
-                if ((rot_add.norm() * 57.3 < 0.01) && (T_add.norm() * 100 < 0.015))
-                    flg_EKF_converged = true;
+                if ((rot_add.norm() * 57.3 < 0.057) && (T_add.norm() * 100 < 0.1)) // 收敛判断：旋转增量<0.057°且平移增量<0.1cm
+                    flg_EKF_converged = true; // 标记EKF已收敛
 
-                deltaR = rot_add.norm() * 57.3;
-                deltaT = T_add.norm() * 100;
+                deltaR = rot_add.norm() * 57.3; // 旋转增量转角度（rad→deg），用于日志
+                deltaT = T_add.norm() * 100; // 平移增量转厘米（m→cm），用于日志
 
-                euler_cur = RotMtoEuler(state.rot_end);
+                euler_cur = RotMtoEuler(state.rot_end); // 更新当前欧拉角
 
-                current_iter_count++;
+                current_iter_count++; // 当前收敛轮内迭代计数+1
                 /*** Rematch Judgement ***/
-                nearest_search_en = false;
-                if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == (NUM_MAX_ITERATIONS - 2))))
+                nearest_search_en = false; // 默认下一轮不重新搜索近邻（用上一轮的近邻结果）
+                if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == (NUM_MAX_ITERATIONS - 2)))) // 如果EKF收敛，或者首次且倒数第2轮（保底重匹配）
                 {
-                    nearest_search_en = true;
-                    rematch_num++;
-                    if(!imu_en){
+                    nearest_search_en = true; // 下一轮需要重新搜索最近邻（状态已更新，近邻可能改变）
+                    rematch_num++; // 重匹配次数+1
+                    if(!imu_en){ // LGO/LO模式特有的全局收敛判断
                         /// 全局收敛判断 两次匹配的收敛状态相差小于阈值 重新进行去畸变
-                        auto delta_state = state - last_converge_state;
+                        auto delta_state = state - last_converge_state; // 当前状态与上次收敛状态的差
 
                         if (((delta_state.block<3, 1>(0, 0).norm() * 57.3 < 1) && (delta_state.block<3, 1>(3, 0).norm() * 100 < 1.0) && iterCount >= 4)
-                                || current_iter_count >= 15)
+                                || current_iter_count >= 15) // 如果两次收敛间旋转差<1°且平移差<1cm且迭代≥4次，或迭代超过15次
                         {
-                            current_converge = true;
-                            current_iter_count = 0;
+                            current_converge = true; // 标记当前轮收敛，下一轮会触发重新去畸变
+                            current_iter_count = 0; // 重置收敛轮内迭代计数
                             /// 如果去畸变次数达到预设值，那么也退出
-                            if (distort_time >= NUM_MAX_UNDISTORT)
+                            if (distort_time >= NUM_MAX_UNDISTORT) // 如果去畸变-ICP循环次数达到上限（默认3次）
                             {
-                                EKF_stop_flg = true;
+                                EKF_stop_flg = true; // 标记EKF停止（整个迭代退出）
                             }
                         }
 
-                        last_converge_state = state;
+                        last_converge_state = state; // 记录本次收敛状态，供下次比较
+                    }
+                }
+
+                /*** LIO模式收敛确认提前退出 ***/
+                if (imu_en) // LIO模式下原代码无退出通道，此处补上：连续2轮收敛即退出，避免空转
+                {
+                    if (flg_EKF_converged)
+                    {
+                        lio_converge_count++;
+                        if (lio_converge_count >= 2)
+                            EKF_stop_flg = true; // 连续第2轮收敛，退出迭代（走正常协方差更新后break）
+                    }
+                    else
+                    {
+                        lio_converge_count = 0; // 未收敛则重新计数（与FAST-LIO的t机制一致）
                     }
                 }
 
                 /*** Adjust const velocity model cov ***/
-                // if (iterCount == 1 && adaptive_cov) adjustCVCov();
+                // if (iterCount == 1 && adaptive_cov) adjustCVCov(); // 自适应协方差调整（当前未启用）
 
 
                 /*** Convergence Judgements and Covariance Update ***/
                 /// 不限制匹配次数
-                if (EKF_stop_flg || ((iterCount == NUM_MAX_ITERATIONS - 1)) )
+                if (EKF_stop_flg || ((iterCount == NUM_MAX_ITERATIONS - 1)) ) // 如果EKF停止或达到最大迭代次数
                 {
-                    if (flg_EKF_inited)
+                    if (flg_EKF_inited) // 如果EKF已初始化（非首帧）
                     {
                         /*** Covariance Update ***/
-                        G.setZero();
-                        G.block<DIM_STATE, 12>(0, 0) = K * Hsub;
-                        state.cov = (I_STATE - G) * state.cov;
-                        total_distance += (state.pos_end - position_last).norm();
-                        position_last = state.pos_end;
+                        G.setZero(); // G矩阵清零
+                        G.block<DIM_STATE, 12>(0, 0) = K * Hsub; // G = K·H（Joseph形式协方差更新的一部分）
+                        state.cov = (I_STATE - G) * state.cov; // 协方差更新：P = (I - K·H)·P（简化形式）
+                        cmp_cov_committed = true; // 初始化对比实验: 本帧协方差已提交
+                        total_distance += (state.pos_end - position_last).norm(); // 累计行驶距离
+                        position_last = state.pos_end; // 更新上一帧位置
 
-                        if (!imu_en) {
+                        if (!imu_en) { // LGO/LO模式：发布IMU系下的姿态
                             // M3D rot_cur_lidar = state.rot_end * state.offset_R_L_I;
                             // V3D euler_cur_lidar = RotMtoEuler(rot_cur_lidar);
                             // geoQuat = tf::createQuaternionMsgFromRollPitchYaw
                             //         (euler_cur_lidar(0), euler_cur_lidar(1), euler_cur_lidar(2));
                             geoQuat = tf::createQuaternionMsgFromRollPitchYaw
-                                    (euler_cur(0), euler_cur(1), euler_cur(2));
-                        } else {
+                                    (euler_cur(0), euler_cur(1), euler_cur(2)); // 欧拉角→四元数（IMU系）
+                        } else { // LIO模式：发布LiDAR系下的姿态
                             //Publish LiDAR's pose, instead of IMU's pose
-                            M3D rot_cur_lidar = state.rot_end * state.offset_R_L_I;
-                            V3D euler_cur_lidar = RotMtoEuler(rot_cur_lidar);
+                            M3D rot_cur_lidar = state.rot_end * state.offset_R_L_I; // LiDAR旋转 = R_IMU · R_L_I
+                            V3D euler_cur_lidar = RotMtoEuler(rot_cur_lidar); // LiDAR欧拉角
                             geoQuat = tf::createQuaternionMsgFromRollPitchYaw
-                                    (euler_cur_lidar(0), euler_cur_lidar(1), euler_cur_lidar(2));
+                                    (euler_cur_lidar(0), euler_cur_lidar(1), euler_cur_lidar(2)); // LiDAR欧拉角→四元数
                         }
-                        VD(DIM_STATE) K_sum = K.rowwise().sum();
-                        VD(DIM_STATE) P_diag = state.cov.diagonal();
+                        VD(DIM_STATE) K_sum = K.rowwise().sum(); // K矩阵行求和（用于调试/分析卡尔曼增益总量）
+                        VD(DIM_STATE) P_diag = state.cov.diagonal(); // 协方差对角线（用于调试/分析状态不确定性）
                     }
-                    EKF_stop_flg = true;
+                    EKF_stop_flg = true; // 确保停止标志为true
                 }
 
-                if (EKF_stop_flg) break;
+                if (EKF_stop_flg) break; // 如果EKF停止，退出迭代循环
             }
 
             std::chrono::steady_clock::time_point icp_end = std::chrono::steady_clock::now();
@@ -1840,6 +2037,59 @@ int main(int argc, char **argv)
             publish_effect_world(pubLaserCloudEffect);
             if (path_en) publish_path(pubPath, measures_num);
             std::chrono::steady_clock::time_point frame_end = std::chrono::steady_clock::now();
+            if (diagnostic.enabled) {
+                diagnostic.applied = cmp_applied;
+                diagnostic.committed = cmp_cov_committed;
+                diagnostic.effective = iter_count > 0 ? effect_feat_num : 0;
+                diagnostic.status = cmp_applied && cmp_cov_committed && diagnostic.effective > 0
+                    ? "post" : (cmp_applied ? "partial_applied" : "predict");
+                diagnostic.reason = diagnostic.effective > 0 ? "matched" : "no_effective_points";
+                diagnostic.iterations = iter_count;
+                diagnostic.searches = knn_count;
+                // Diagnostic-only mean absolute point-to-plane residual at the last
+                // linearization. Do not reuse the legacy, never-accumulated total_residual.
+                if (diagnostic.effective > 0) {
+                    double absolute_residual_sum = 0.0;
+                    for (int i = 0; i < diagnostic.effective; ++i)
+                        absolute_residual_sum += std::fabs(corr_normvect->points[i].intensity);
+                    diagnostic.residual = absolute_residual_sum / diagnostic.effective;
+                }
+                diagnostic.noise = cov_lidar;
+                auto ms = [](std::chrono::steady_clock::time_point a,
+                             std::chrono::steady_clock::time_point b) {
+                    return std::chrono::duration<double, std::milli>(b - a).count();
+                };
+                diagnostic.frame_ms = ms(t_imu_process_begin, frame_end);
+                diagnostic.imu_ms = ms(t_imu_process_begin, t_imu_process_end);
+                diagnostic.down_ms = ms(t_downfilter_begin, t_downfilter_end);
+                diagnostic.icp_ms = ms(icp_begin, icp_end);
+                diagnostic.map_ms = ms(map_increment_begin, map_increment_end);
+                diagnostic.match_ms = knn_time * 1000;
+                diagnostic.solve_ms = solve_time * 1000;
+                if (diagnostic.effective > 0) diagnostic.information(H_T_H.block<6, 6>(0, 0));
+            }
+            diagnostic.update(state); // 即时冻结更新后状态, 先于后续批解与重置改写 state
+
+            if (!dynamic_init->dynamic_init_fished)
+            {
+                double f_imu   = std::chrono::duration_cast<std::chrono::duration<double> >(t_imu_process_end - t_imu_process_begin).count() * 1000;
+                double f_down  = std::chrono::duration_cast<std::chrono::duration<double> >(t_downfilter_end - t_downfilter_begin).count() * 1000;
+                double f_icp   = std::chrono::duration_cast<std::chrono::duration<double> >(icp_end - icp_begin).count() * 1000;
+                double f_pubod = std::chrono::duration_cast<std::chrono::duration<double> >(map_increment_begin - icp_end).count() * 1000;
+                double f_map   = std::chrono::duration_cast<std::chrono::duration<double> >(map_increment_end - map_increment_begin).count() * 1000;
+                double f_pubtl = std::chrono::duration_cast<std::chrono::duration<double> >(frame_end - map_increment_end).count() * 1000;
+                double f_total = std::chrono::duration_cast<std::chrono::duration<double> >(frame_end - t_imu_process_begin).count() * 1000;
+                Li_D_init_frame_time << lidar_end_time << " "
+                    << std::chrono::duration_cast<std::chrono::duration<double> >(frame_end - t_program_begin).count() * 1000 << " "
+                    << frame_id << " " << pass_id << " " << measures_num << " " << 0 << " " << (int)imu_en << " "
+                    << f_total << " " << f_imu << " " << f_down << " " << f_icp << " "
+                    << knn_time * 1000 << " " << solve_time * 1000 << " "
+                    << f_pubod << " " << f_map << " " << f_pubtl << " "
+                    << iter_count << " " << knn_count << " " << rematch_num << " "
+                    << effect_feat_num << " " << feats_points_size << " " << feats_points_full_size << " "
+                    << kdtree_size_st << " " << kdtree_size_end << " "
+                    << res_mean_last << " " << -1 << endl;
+            }
             // if(frame_num < 100 && imu_en){
             //     downSizeMap_fir.setInputCloud(feats_map);
             //     downSizeMap_fir.filter(*feats_map_down_fir);
@@ -1871,11 +2121,69 @@ int main(int argc, char **argv)
             }
 
             frame_num++;
+
+            {
+                std::string cmp_rtype = "predict";
+                if (flg_EKF_inited && cmp_applied && cmp_cov_committed)      cmp_rtype = "post";
+                else if (flg_EKF_inited && cmp_applied)                     cmp_rtype = "partial_applied";
+                else if (flg_EKF_inited && !cmp_applied && cmp_propagated)  cmp_rtype = "invalid";
+                cmp_states << lidar_end_time << " " << cmp_rtype << " "
+                    << (int)cmp_applied << " " << (int)cmp_cov_committed << " " << (int)cmp_propagated << " "
+                    << (int)flg_EKF_inited << " " << (int)imu_en << " " << effect_feat_num << " "
+                    << state.vel_end.transpose() << " "
+                    << state.bias_g.transpose() << " "
+                    << state.gravity.transpose() << endl;
+                if (!cmp_first_post_written && cmp_rtype == "post" && dynamic_init->dynamic_init_fished)
+                {
+                    // 初始化完成后的首个有效正式后验(时间协议与每帧行的 t_state 一致)
+                    cmp_first_post_written = true;
+                    cmp_events << "first_post " << lidar_end_time << " "
+                        << state.vel_end.transpose() << " "
+                        << state.bias_g.transpose() << " "
+                        << state.gravity.transpose() << endl;
+                }
+            }
+
+
+            double rtk_t = 0; V3D rtk_v = V3D::Zero();
+            bool rtk_ok = get_rtk_at(lidar_end_time, rtk_t, rtk_v);
+            if (diagnostic.enabled) {
+                diagnostic.rtk_found = rtk_ok;
+                if (rtk_ok) {
+                    diagnostic.rtk_time = rtk_t;
+                    diagnostic.rtk_velocity = rtk_v;
+                }
+            }
             Li_D_init_fastlio <<  std::fixed << std::setprecision(9) 
             <<lidar_end_time << " " 
             <<state.vel_end.transpose() << " " 
             << state.bias_g.transpose() << " " 
-            << state.gravity.transpose() << " " << endl;        
+            << state.gravity.transpose() << " " 
+            << init_frame_flag << " " 
+            << (rtk_ok ? rtk_t : std::nan("")) << " " 
+            << (rtk_ok ? rtk_v(0) : std::nan("")) << " " 
+            << (rtk_ok ? rtk_v(1) : std::nan("")) << " " 
+            << (rtk_ok ? rtk_v(2) : std::nan("")) << " " << endl;
+
+            if (dynamic_init->dynamic_init_fished)
+            {
+                double imu_ms = std::chrono::duration_cast<std::chrono::duration<double> >(t_imu_process_end - t_imu_process_begin).count() * 1000;
+                double downfilter_ms = std::chrono::duration_cast<std::chrono::duration<double> >(t_downfilter_end - t_downfilter_begin).count() * 1000;
+                double icp_ms = std::chrono::duration_cast<std::chrono::duration<double> >(icp_end - icp_begin).count() * 1000;
+                double map_inc_ms = std::chrono::duration_cast<std::chrono::duration<double> >(map_increment_end - map_increment_begin).count() * 1000;
+                double frame_total_ms = std::chrono::duration_cast<std::chrono::duration<double> >(frame_end - t_imu_process_begin).count() * 1000;
+                Li_D_init_lio_time << std::fixed << std::setprecision(6)
+                    << lidar_end_time << " "
+                    << frame_total_ms << " "
+                    << imu_ms << " "
+                    << downfilter_ms << " "
+                    << icp_ms << " "
+                    << knn_time * 1000 << " "
+                    << solve_time * 1000 << " "
+                    << map_inc_ms << " "
+                    << std::chrono::duration_cast<std::chrono::duration<double> >(frame_end - t_program_begin).count() * 1000 << " "
+                    << effect_feat_num << " " << feats_points_size << " " << feats_points_full_size << endl;
+            }
             if(!dynamic_init->dynamic_init_fished){
                 if(!Iteration_begin){
                     dynamic_init->Data_processing_lo(state.rot_end, state.pos_end, Measures.lidar_end_time, p_imu->tmp_pre_integration);
@@ -1886,9 +2194,16 @@ int main(int argc, char **argv)
                     // dynamic_init->system_state[measures_num].T = state.pos_end - Lidar_T_wrt_IMU;
                 }
             }
+            diagnostic.finish(state); // Freeze the frame before any batch solve/reset.
             if(!LGO_MODE && measures_num == dynamic_init->data_accum_length - 1 && !dynamic_init->dynamic_init_fished){
                 if(!dynamic_init->dynamic_init_fished){
                     std::chrono::steady_clock::time_point t_solve_begin = std::chrono::steady_clock::now();
+                    // 只读诊断: 批解观察者仅在求解期间借用, 不写任何估计器状态
+                    std::unique_ptr<drift_diag::Batch> batch_diagnostic;
+                    if (diagnostics_enabled) {
+                        drift_diag::context().batch_id = pass_id;
+                        batch_diagnostic.reset(new drift_diag::Batch(*dynamic_init, Measures.lidar_end_time, false));
+                    }
                     dynamic_init->solve_Rot_bias_gyro();
                     VectorXd x_;
                     dynamic_init->LinearAlignment_withoutba(state, x_);
@@ -1896,10 +2211,25 @@ int main(int argc, char **argv)
                     d_init_solve_time = std::chrono::duration_cast<std::chrono::duration<double> >(t_solve_end - t_solve_begin).count();
                     sum_d_init_solve_time += std::chrono::duration_cast<std::chrono::duration<double> >(t_solve_end - t_solve_begin).count();
                     current_g = dynamic_init->get_g();
+                    current_v = dynamic_init->get_V_0();
+                    if (batch_diagnostic) {
+                        // 相邻批解初速度差: 首轮无上一轮解记 null
+                        const double batch_delta_v = Iteration_begin ? (current_v - Last_v).norm()
+                                                                    : drift_diag::missing();
+                        batch_diagnostic->finish(x_, current_v, dynamic_init->get_Grav_L0(),
+                                                 dynamic_init->get_gyro_bias(), Zero3d,
+                                                 batch_delta_v, Iteration_v,
+                                                 d_init_solve_time * 1000.0,
+                                                 dynamic_init->solve_diagnostic_ms,
+                                                 std::chrono::duration<double, std::milli>(
+                                                     std::chrono::steady_clock::now() - t_pass_begin).count());
+                        batch_diagnostic.reset(); // 状态重置前先解绑观察者
+                    }
                     if(!Iteration_begin){
                         Iteration_begin = true;
                         cout<<"kaishidiedai!!!"<<endl;
                         Last_g = dynamic_init->get_g();
+                        Last_v = dynamic_init->get_V_0();
                         state.bias_a = Zero3d;
                         state.offset_R_L_I = Lidar_R_wrt_IMU;
                         state.offset_T_L_I = Lidar_T_wrt_IMU;
@@ -1931,15 +2261,99 @@ int main(int argc, char **argv)
                         // flg_reset = true;
                         ikdtree.delete_tree_nodes(&ikdtree.Root_Node);
                         feats_undistort == NULL;
+                        // 数据分析: 首轮(预处理+首次求解)迭代耗时, 首轮无上一轮解, delta_v 写-1
+                        Li_D_init_iter_time << std::fixed << std::setprecision(6)
+                            << pass_id << " "
+                            << d_init_solve_time * 1000 << " "
+                            << std::chrono::duration_cast<std::chrono::duration<double> >(std::chrono::steady_clock::now() - t_pass_begin).count() * 1000 << " "
+                            << -1.0 << " " << 0 << endl;
+                        pass_id++;
                         continue;
                     }
                 }
-                if(abs(Last_g-current_g) < Iteration || iteration_num == Iteration_NUM)
+                // 采用相邻两次迭代初速度向量差范数作为收敛判据
+                if((current_v - Last_v).norm() < Iteration_v || iteration_num == Iteration_NUM)
                 {
                     dynamic_init->dynamic_init_fished = true;
+                    if (diagnostics_enabled) {
+                        // 完成时钟统一: 后续 LIO 帧的 relative_time 以交接帧数据时间为锚
+                        drift_diag::context().handoff_time = Measures.lidar_end_time;
+                        drift_diag::event("init_done", lidar_end_time,
+                            (current_v - Last_v).norm() < Iteration_v ? "converged" : "max_iter");
+                    }
+                    {
+                        double t_sim_now = -1.0, lag_ms = -1.0;
+                        if (ros::Time::isSimTime())
+                        {
+                            t_sim_now = ros::Time::now().toSec();
+                            // now() 在收到首条 /clock 前为 0, 此时不可用
+                            if (t_sim_now > 0.0 && Measures.lidar_end_time > 0.0)
+                                lag_ms = (t_sim_now - Measures.lidar_end_time) * 1000.0;
+                        }
+                        bool lag_converged = ((current_v - Last_v).norm() < Iteration_v);
+                        if (lag_ms >= 0.0)
+                            ROS_INFO("[System delay] After Dynamic initialization: time=%.6f s, "
+                                     "sim time=%.6f s, system delay=%.1f ms (%.3f s, %s)",
+                                     Measures.lidar_end_time, t_sim_now, lag_ms, lag_ms / 1000.0,
+                                     lag_converged ? "速度收敛" : "达最大迭代");
+                        else
+                            ROS_WARN("[System delay] After Dynamic initialization: use_sim_time = false, cannot compute system delay");
+                        Li_D_init_lag << Measures.lidar_end_time << " " << t_sim_now << " "
+                                      << lag_ms << " " << pass_id << " "
+                                      << (lag_converged ? 1 : 0) << endl;
+                    }
+                    // ==== 初始化对比实验: 批量解参照行 + init_done 事件 ====
+                    {
+                        bool cmp_converged = ((current_v - Last_v).norm() < Iteration_v);
+                        double cmp_t_first = dynamic_init->Initialized_data.empty() ? std::nan("")
+                            : dynamic_init->Initialized_data.front().lidar_end_time;
+                        cmp_events << "batch_solution " << cmp_t_first << " "
+                            << dynamic_init->get_V_0().transpose() << " "
+                            << (Lidar_R_wrt_IMU.transpose() * dynamic_init->get_V_0()).transpose() << " "
+                            << dynamic_init->get_gyro_bias().transpose() << " "
+                            << dynamic_init->get_Grav_L0().transpose() << " "
+                            << (-(Lidar_R_wrt_IMU.transpose() * dynamic_init->get_Grav_L0())).transpose() << endl;
+                        cmp_events << "init_done " << Measures.lidar_end_time << " "
+                            << (cmp_converged ? "converged" : "max_iter") << " "
+                            << state.vel_end.transpose() << " "
+                            << state.bias_g.transpose() << " "
+                            << state.gravity.transpose() << " "
+                            << state.pos_end.transpose() << " "
+                            << state_propagat.vel_end.transpose() << " "
+                            << state_propagat.bias_g.transpose() << " "
+                            << state_propagat.gravity.transpose() << endl;
+                    }
+
+                    // 速度初值=R_LI^T*V_0, 零偏=gyro_bias, 重力=-(R_LI^T*Grav_L0), 与状态重置公式一致
+                    double rtk_t2 = 0; V3D rtk_v2 = V3D::Zero();
+                    bool rtk_ok2 = get_rtk_at(Measures.lidar_end_time, rtk_t2, rtk_v2);
+                    Li_D_init_fastlio << std::fixed << std::setprecision(9)
+                    << Measures.lidar_end_time << " "
+                    << (Lidar_R_wrt_IMU.transpose() * dynamic_init->get_V_0()).transpose() << " "
+                    << dynamic_init->get_gyro_bias().transpose() << " "
+                    << (-(Lidar_R_wrt_IMU.transpose() * dynamic_init->get_Grav_L0())).transpose() << " "
+                    << 1 << " "
+                    << (rtk_ok2 ? rtk_t2 : std::nan("")) << " "
+                    << (rtk_ok2 ? rtk_v2(0) : std::nan("")) << " "
+                    << (rtk_ok2 ? rtk_v2(1) : std::nan("")) << " "
+                    << (rtk_ok2 ? rtk_v2(2) : std::nan("")) << " " << endl;
+                    Li_D_init_iter_time << std::fixed << std::setprecision(6)
+                        << pass_id << " "
+                        << d_init_solve_time * 1000 << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(std::chrono::steady_clock::now() - t_pass_begin).count() * 1000 << " "
+                        << (current_v - Last_v).norm() << " " << 1 << endl;
+                    pass_id++;
+                    init_frame_flag = 2;
                 }else{
                     iteration_num ++;
+                    Li_D_init_iter_time << std::fixed << std::setprecision(6)
+                        << pass_id << " "
+                        << d_init_solve_time * 1000 << " "
+                        << std::chrono::duration_cast<std::chrono::duration<double> >(std::chrono::steady_clock::now() - t_pass_begin).count() * 1000 << " "
+                        << (current_v - Last_v).norm() << " " << 0 << endl;
+                    pass_id++;
                     Last_g = dynamic_init->get_g();
+                    Last_v = current_v; // 供下一轮判据使用
                     state.bias_a = Zero3d;
                     state.offset_R_L_I = Lidar_R_wrt_IMU;
                     state.offset_T_L_I = Lidar_T_wrt_IMU;
@@ -1973,8 +2387,13 @@ int main(int argc, char **argv)
             }
         }
         status = ros::ok();
-        rate.sleep();
+        if (diagnostics_enabled) diagnostics_rate.sleep();
+        else rate.sleep();
     }
 
+    if (diagnostics_enabled) {
+        drift_diag::event("shutdown", diagnostics_processed, "normal");
+        google::ShutdownGoogleLogging();
+    }
     return 0;
 }

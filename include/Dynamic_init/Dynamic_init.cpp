@@ -1,4 +1,6 @@
 #include "Dynamic_init.h"
+#include <chrono>
+#include <limits>
 
 double last_lidar_end_time_ = 0;   
 V3D angvel_last;
@@ -98,7 +100,17 @@ void Dynamic_init::solve_Rot_bias_gyro() {
         A += tmp_A.transpose() * tmp_A;
         b += tmp_A.transpose() * tmp_b;
     }
-    delta_bg = A.ldlt().solve(b);
+    auto decomposition = A.ldlt();
+    const auto decomposition_status = decomposition.info();
+    delta_bg = decomposition.solve(b);
+    if (solve_observer) {
+        const auto diagnostic_begin = std::chrono::steady_clock::now();
+        solve_observer->solved("gyro_bias", -1, A, b,
+            delta_bg, V3D::Constant(std::numeric_limits<double>::quiet_NaN()),
+            decomposition_status, decomposition.info());
+        solve_diagnostic_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - diagnostic_begin).count();
+    }
     ROS_WARN_STREAM("gyroscope bias initial calibration " << delta_bg.transpose());
 
     gyro_bias += delta_bg;
@@ -187,9 +199,19 @@ void Dynamic_init::RefineGravity(StatesGroup icp_state, Vector3d &g, VectorXd &x
         }
         A = A * 1000.0;
         b = b * 1000.0;
-        x = A.ldlt().solve(b);
+        auto decomposition = A.ldlt();
+        const auto decomposition_status = decomposition.info();
+        x = decomposition.solve(b);
+        const auto solve_status = decomposition.info();
             VectorXd dg = x.segment<2>(n_state - 5);
             g0 = (g0 + lxly * dg).normalized() * G.norm();
+        if (solve_observer) {
+            const auto diagnostic_begin = std::chrono::steady_clock::now();
+            solve_observer->solved("gravity_refine", k, A, b,
+                x, g0, decomposition_status, solve_status);
+            solve_diagnostic_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - diagnostic_begin).count();
+        }
             //double s = x(n_state - 1);
     }   
     g = g0;
@@ -247,11 +269,22 @@ void Dynamic_init::LinearAlignment(StatesGroup icp_state, VectorXd &x){
     }
     A = A * 1000.0;
     b = b * 1000.0;
-    x = A.ldlt().solve(b);
-    std::ofstream outFile("/home/myx/fighting/dynamic_init_lidar_inertial/src/LiDAR_DYNAMIC_INIT/Log/A_ba.txt");
-    outFile<<A;
-    outFile.close();
+    auto decomposition = A.ldlt();
+    const auto decomposition_status = decomposition.info();
+    x = decomposition.solve(b);
+    const auto solve_status = decomposition.info();
+    if (debug_dump_matrices) {
+        std::ofstream outFile(DEBUG_FILE_DIR("A_ba.txt"));
+        outFile << A;
+    }
     Vector3d g = x.segment<3>(n_state - 6);
+    if (solve_observer) {
+        const auto diagnostic_begin = std::chrono::steady_clock::now();
+        solve_observer->solved("linear_initial", -1, A, b,
+            x, g, decomposition_status, solve_status);
+        solve_diagnostic_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - diagnostic_begin).count();
+    }
     auto ba = x.segment<3>(n_state - 3);
     auto v_0 = x.segment<3>(0);
     cout<<"size: "<<x.size()<<endl;
@@ -262,7 +295,7 @@ void Dynamic_init::LinearAlignment(StatesGroup icp_state, VectorXd &x){
     auto ba_ = x.segment<3>(n_state - 4);
     cout<<"size: "<<x.size()<<endl;
     auto v_0_ = x.segment<3>(0);
-    cout<<"----------------------------------------------------"<<endl;
+    cout<<"---------------------------------"<<endl;
     ROS_WARN_STREAM(" result g     " << g.norm() << " " << g.transpose());
     ROS_WARN_STREAM(" ba     " <<  ba.transpose());
     ROS_WARN_STREAM(" v_0     " <<  v_0_.transpose());
@@ -329,9 +362,19 @@ void Dynamic_init::RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, V
         }
         A = A * 1000.0;
         b = b * 1000.0;
-        x = A.ldlt().solve(b);
+        auto decomposition = A.ldlt();
+        const auto decomposition_status = decomposition.info();
+        x = decomposition.solve(b);
+        const auto solve_status = decomposition.info();
             VectorXd dg = x.segment<2>(n_state - 2);
             g0 = (g0 + lxly * dg).normalized() * G.norm();
+        if (solve_observer) {
+            const auto diagnostic_begin = std::chrono::steady_clock::now();
+            solve_observer->solved("gravity_refine", k, A, b,
+                x, g0, decomposition_status, solve_status);
+            solve_diagnostic_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - diagnostic_begin).count();
+        }
             //double s = x(n_state - 1);
     }   
     g = g0;
@@ -386,19 +429,30 @@ void Dynamic_init::LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x)
     }
     A = A * 1000.0;
     b = b * 1000.0;
-    x = A.ldlt().solve(b);
+    auto decomposition = A.ldlt();
+    const auto decomposition_status = decomposition.info();
+    x = decomposition.solve(b);
+    const auto solve_status = decomposition.info();
     Vector3d g = x.segment<3>(n_state - 3);
+    if (solve_observer) {
+        const auto diagnostic_begin = std::chrono::steady_clock::now();
+        solve_observer->solved("linear_initial", -1, A, b,
+            x, g, decomposition_status, solve_status);
+        solve_diagnostic_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - diagnostic_begin).count();
+    }
     auto v_0 = x.segment<3>(0);
-    std::ofstream outFile("/home/myx/fighting/dynamic_init_lidar_inertial/src/LiDAR_DYNAMIC_INIT/Log/A.txt");
-    outFile<<A;
-    outFile.close();
+    if (debug_dump_matrices) {
+        std::ofstream outFile(DEBUG_FILE_DIR("A.txt"));
+        outFile << A;
+    }
     // cout<<"size: "<<x.size()<<endl;
     ROS_WARN_STREAM(" result g     " << g.norm() << " " << g.transpose());
     ROS_WARN_STREAM(" v_0     " <<  v_0.transpose());
     g_ = g.norm();
     RefineGravity_withoutba(icp_state, g, x);
     auto v_0_ = x.segment<3>(0);
-    cout<<"----------------------------------------------------"<<endl;
+    cout<<"------------------------- After RefineGravity ---------------------------"<<endl;
     ROS_WARN_STREAM(" result g     " << g.norm() << " " << g.transpose());
     ROS_WARN_STREAM(" v_0     " <<  v_0_.transpose());
     Grav_L0 = g;

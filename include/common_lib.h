@@ -13,6 +13,7 @@
 #include <eigen_conversions/eigen_msg.h>
 #include <color.h>
 #include <scope_timer.hpp>
+#include <cstdlib>
 
 #include <tr1/unordered_map>
 // robin map
@@ -37,7 +38,11 @@ using namespace Eigen;
 #define VEC_FROM_ARRAY(v)        v[0],v[1],v[2]
 #define MAT_FROM_ARRAY(v)        v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]
 
-#define DEBUG_FILE_DIR(name)     (string(string(ROOT_DIR) + "Log/"+ name))
+inline std::string diagnostic_log_directory() {
+    const char* directory = std::getenv("DLI_LOG_DIR");
+    return directory && *directory ? std::string(directory) : std::string(ROOT_DIR) + "Log";
+}
+#define DEBUG_FILE_DIR(name)     (diagnostic_log_directory() + "/" + (name))
 #define RESULT_FILE_DIR(name)    (string(string(ROOT_DIR) + "result/"+ name))
 
 typedef lidar_imu_init::Pose6D     Pose6D;
