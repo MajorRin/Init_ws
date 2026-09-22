@@ -1,0 +1,12 @@
+Log/
+log/
+__pycache__/
+*.pyc
+*.pyo
+scripts/drift_runs/
+scripts/init_comparison/runs/
+build/
+devel/
+install/
+*.pcd
+*.bag
