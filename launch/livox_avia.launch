@@ -11,11 +11,23 @@
 	<rosparam command="load" file="$(find lidar_imu_init)/config/avia.yaml" />
 
 	<node pkg="lidar_imu_init" type="lidar_imu_init" name="laserMapping" output="screen" />
-    <param name="Iteration_NUM" type="int" value="20" />
-    <param name="Data_accum_length" type="int" value="22" />
+    <param name="Iteration_NUM" type="int" value="7" />
+    <param name="Data_accum_length" type="int" value="15" />
 	<!-- <param name="Iteration" type="double" value="0.02" /> -->
 	<param name="Iteration" type="double" value="0.2" />
-	<param name="Iteration_v" type="double" value="0.3" />
+	<param name="Iteration_v" type="double" value="1.0" />
+	<!-- [INIT-GATE] 批解写回闸门 (en=0 回退旧行为) -->
+	<param name="init_gate/en" type="bool" value="1" />
+	<param name="init_gate/max_v0_norm" type="double" value="20.0" />
+	<param name="init_gate/g_expected" type="double" value="-1.0" />
+	<param name="init_gate/g_dev_ratio" type="double" value="0.7" />
+	<param name="init_gate/max_bg_norm" type="double" value="0.1" />
+	<!-- [COND-NUM] 陀螺偏置法方程条件数: 每次批解逐轮打印, 关掉置 0 -->
+	<param name="init_diag/cond_num_en" type="bool" value="0" />
+	<!-- [SPEED-PRIOR] 速度模长先验: 在 LinearAlignment_withoutba 法方程中加入软约束 -->
+	<param name="speed_prior/lambda" type="double" value="10.0" />
+	<!-- [FIRST-FRAME-DESKEW] 首帧旋转去畸变: 仅用陀螺数据, 置 0 恢复旧行为(首帧不去畸变) -->
+	<param name="first_frame_deskew_en" type="bool" value="1" />
 	<param name="LGO_MODE" type="bool" value="0" />
 	<param name="LO_MODE" type="bool" value="0" />
 	<param name="LIO_MODE" type="bool" value="0" />
@@ -23,7 +35,7 @@
 	<param name="use_sim_time" type="bool" value="$(arg use_sim_time)" />
 	<!-- <param name="use_sim_time" type="bool" value="true" /> -->
 	<group if="$(arg rviz)">
-	<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find lidar_imu_init)/rviz_cfg/D_Li_init.rviz" />
+	<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find lidar_imu_init)/rviz_cfg/loam_livox.rviz" />
 	</group>
 
 	launch-prefix="gdb -ex run --args"

@@ -80,6 +80,11 @@ public:
     SolveObserver* solve_observer = nullptr;
     double solve_diagnostic_ms = 0;
     bool debug_dump_matrices = false;
+    // [COND-NUM] 环节2 陀螺偏置法方程条件数打印开关(launch: init_diag/cond_num_en)
+    bool cond_num_en = false;
+    // [SPEED-PRIOR] 速度模长先验: lambda > 0 时在 LinearAlignment_withoutba 中加入
+    // 软约束 d^T * V0 ≈ rtk_speed (d = 上一轮 V0 方向), 降低法方程条件数
+    double speed_prior_lambda = 0.0;
 
     Dynamic_init();
 
@@ -88,9 +93,13 @@ public:
 
     void solve_Rot_bias_gyro();
     void LinearAlignment(StatesGroup icp_state, VectorXd &x);
-    void LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x);
+    void LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x,
+                                   double rtk_speed_prior = -1.0,
+                                   const Vector3d &prev_v0 = Vector3d::Zero());
     void RefineGravity(StatesGroup icp_state, Vector3d &g, VectorXd &x);
-    void RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, VectorXd &x);
+    void RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, VectorXd &x,
+                                 double rtk_speed_prior = -1.0,
+                                 const Vector3d &prev_v0 = Vector3d::Zero());
     void Dynamic_Initialization(int &orig_odom_freq, int &cut_frame_num, double &timediff_imu_wrt_lidar,
                             const double &move_start_time);
     bool Data_processing(MeasureGroup& meas);
@@ -104,6 +113,13 @@ public:
     }
     inline V3D get_gyro_bias() {
         return gyro_bias;
+    }
+    inline void set_gyro_bias(const V3D &bg) {
+        gyro_bias = bg;
+        for (auto frame_i = system_state.begin(); next(frame_i) != system_state.end(); frame_i++) {
+            auto frame_j = next(frame_i);
+            frame_j->pre_integration->repropagate(Vector3d::Zero(), gyro_bias);
+        }
     }
     inline V3D get_acc_bias() {
         return acc_bias;

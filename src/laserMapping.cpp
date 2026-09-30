@@ -1134,7 +1134,14 @@ void publish_odometry(const ros::Publisher &pubOdomAftMapped) {
     q.setY(odomAftMapped.pose.pose.orientation.y);
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation(q);
-    br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped"));
+    // 批解重放阶段每个 pass 重放相同帧, 同一时间戳的 TF 被重复广播, tf 接收端报
+    // TF_REPEATED_DATA 且直接丢弃(第一条生效) —— 在源头去重, 冗余广播零损失.
+    static double last_tf_stamp = -1.0;
+    const double tf_stamp = odomAftMapped.header.stamp.toSec();
+    if (tf_stamp > last_tf_stamp) {
+        br.sendTransform(tf::StampedTransform(transform, odomAftMapped.header.stamp, "camera_init", "aft_mapped"));
+        last_tf_stamp = tf_stamp;
+    }
 }
 
 void publish_mavros(const ros::Publisher &mavros_pose_publisher) {
@@ -1436,7 +1443,12 @@ int main(int argc, char **argv)
     int init_frame_flag = 0;
     // 数据分析: 动态初始化迭代计时
     std::chrono::steady_clock::time_point t_pass_begin = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t_init_phase_begin;
+    bool t_init_phase_begin_set = false;
     int pass_id = 0;
+    // [BATCH-INTERVAL] 跨轮持久: 上一轮批解结束时刻(用于打印连续两次批解之间的间隔耗时)
+    std::chrono::steady_clock::time_point t_prev_solve_end = std::chrono::steady_clock::now();
+    bool have_prev_solve = false;
     nh.getParam("/Iteration_NUM", Iteration_NUM);
     nh.getParam("/Data_accum_length", dynamic_init->data_accum_length);
     nh.getParam("/Iteration", Iteration);
@@ -1444,6 +1456,23 @@ int main(int argc, char **argv)
     nh.getParam("/LGO_MODE", LGO_MODE);
     nh.getParam("/LO_MODE", LO_MODE);
     nh.getParam("/LIO_MODE", LIO_MODE);
+    // [INIT-GATE] 批解写回闸门: en=0 回退旧行为
+    bool init_gate_en = true;
+    double init_gate_max_v0 = 5.0;
+    double init_gate_g_expected = 0.0;
+    double init_gate_g_dev = 0.2;
+    double init_gate_max_bg = 0.2;
+    nh.getParam("/init_gate/en", init_gate_en);
+    nh.getParam("/init_gate/max_v0_norm", init_gate_max_v0);
+    nh.getParam("/init_gate/g_expected", init_gate_g_expected);
+    nh.getParam("/init_gate/g_dev_ratio", init_gate_g_dev);
+    nh.getParam("/init_gate/max_bg_norm", init_gate_max_bg);
+    // [COND-NUM] 环节2 陀螺偏置法方程条件数打印开关(每次批解都输出)
+    nh.getParam("/init_diag/cond_num_en", dynamic_init->cond_num_en);
+    // [SPEED-PRIOR] 速度模长先验: lambda > 0 时启用, 0 关闭
+    nh.getParam("/speed_prior/lambda", dynamic_init->speed_prior_lambda);
+    // [FIRST-FRAME-DESKEW] 首帧(种子图)旋转去畸变开关: 仅用陀螺数据, 置 0 恢复旧行为(首帧不去畸变)
+    nh.getParam("/first_frame_deskew_en", p_imu->first_frame_deskew_en);
     p_imu->LGO_MODE = LGO_MODE;
     p_imu->LO_MODE = LO_MODE;
     p_imu->LIO_MODE = LIO_MODE;
@@ -1464,6 +1493,7 @@ int main(int argc, char **argv)
     bool status = ros::ok();
     int frame_id = 0;
     int iteration_num = 0;
+    bool gate_any_accept = false;
     int measures_num = -1;
     bool data_alignment = 0;
     std::chrono::steady_clock::time_point t_program_begin = std::chrono::steady_clock::now();
@@ -1632,7 +1662,8 @@ int main(int argc, char **argv)
                     feats_down_world->resize(feats_points_full_size);
                     for (int i = 0; i < feats_points_full_size; i++)
                     {
-                        // 第一帧不去畸变
+                        // 第一帧去畸变与否由 first_frame_deskew_en 决定: 关闭=旧行为(RAW 畸变点入图);
+                        // 开启时 feats_undistort 已在 ImuProcess 首帧分支内完成仅陀螺的旋转去畸变
                         if(imu_en){
                             pointBodyToWorld(&(feats_undistort->points[i]), &(feats_down_world->points[i]));
                         }else{
@@ -1642,7 +1673,9 @@ int main(int argc, char **argv)
                     ikdtree.Build(feats_down_world->points);
                 }
                 if(!imu_en){
-                    if(!Iteration_begin){
+                    // [INIT-GATE] 缓存未满才 push; 拒绝轮 Iteration_begin 保持 false,
+                    // 若只看该标志会持续 push_back 导致 system_state 逐轮膨胀
+                    if(!Iteration_begin && (int)dynamic_init->system_state.size() < dynamic_init->data_accum_length){
                         dynamic_init->Data_processing_lo(state.rot_end, state.pos_end, Measures.lidar_end_time, p_imu->tmp_pre_integration);
                     }else{
                         dynamic_init->system_state[measures_num].R = state.rot_end;
@@ -2185,7 +2218,9 @@ int main(int argc, char **argv)
                     << effect_feat_num << " " << feats_points_size << " " << feats_points_full_size << endl;
             }
             if(!dynamic_init->dynamic_init_fished){
-                if(!Iteration_begin){
+                // [INIT-GATE] 缓存未满才 push; 拒绝轮 Iteration_begin 保持 false,
+                // 若只看该标志会持续 push_back 导致 system_state 逐轮膨胀
+                if(!Iteration_begin && (int)dynamic_init->system_state.size() < dynamic_init->data_accum_length){
                     dynamic_init->Data_processing_lo(state.rot_end, state.pos_end, Measures.lidar_end_time, p_imu->tmp_pre_integration);
                 }else{
                     // dynamic_init->system_state[measures_num].R = Lidar_R_wrt_IMU.transpose() * state.rot_end;
@@ -2197,6 +2232,10 @@ int main(int argc, char **argv)
             diagnostic.finish(state); // Freeze the frame before any batch solve/reset.
             if(!LGO_MODE && measures_num == dynamic_init->data_accum_length - 1 && !dynamic_init->dynamic_init_fished){
                 if(!dynamic_init->dynamic_init_fished){
+                    if (!t_init_phase_begin_set) {
+                        t_init_phase_begin = std::chrono::steady_clock::now();
+                        t_init_phase_begin_set = true;
+                    }
                     std::chrono::steady_clock::time_point t_solve_begin = std::chrono::steady_clock::now();
                     // 只读诊断: 批解观察者仅在求解期间借用, 不写任何估计器状态
                     std::unique_ptr<drift_diag::Batch> batch_diagnostic;
@@ -2204,12 +2243,38 @@ int main(int argc, char **argv)
                         drift_diag::context().batch_id = pass_id;
                         batch_diagnostic.reset(new drift_diag::Batch(*dynamic_init, Measures.lidar_end_time, false));
                     }
+                    V3D gyro_bias_backup = dynamic_init->get_gyro_bias();
                     dynamic_init->solve_Rot_bias_gyro();
                     VectorXd x_;
-                    dynamic_init->LinearAlignment_withoutba(state, x_);
+                    {
+                        double rtk_speed_for_prior = -1.0;
+                        if (dynamic_init->speed_prior_lambda > 0.0 && Iteration_begin) {
+                            double rtk_t_tmp = 0; V3D rtk_v_tmp = V3D::Zero();
+                            if (get_rtk_at(Measures.lidar_end_time, rtk_t_tmp, rtk_v_tmp)) {
+                                rtk_speed_for_prior = rtk_v_tmp.norm();
+                                ROS_INFO("[SPEED-PRIOR] pass %d: RTK speed=%.3f m/s (t_rtk=%.3f, t_query=%.3f, dt=%.3f s)",
+                                         pass_id, rtk_speed_for_prior, rtk_t_tmp,
+                                         Measures.lidar_end_time, rtk_t_tmp - Measures.lidar_end_time);
+                            } else {
+                                ROS_WARN("[SPEED-PRIOR] pass %d: lambda=%.1f but NO RTK data available, prior skipped",
+                                         pass_id, dynamic_init->speed_prior_lambda);
+                            }
+                        }
+                        dynamic_init->LinearAlignment_withoutba(state, x_, rtk_speed_for_prior, Last_v);
+                    }
                     std::chrono::steady_clock::time_point t_solve_end = std::chrono::steady_clock::now();
                     d_init_solve_time = std::chrono::duration_cast<std::chrono::duration<double> >(t_solve_end - t_solve_begin).count();
                     sum_d_init_solve_time += std::chrono::duration_cast<std::chrono::duration<double> >(t_solve_end - t_solve_begin).count();
+                    if (have_prev_solve) {
+                        const double batch_interval_ms = std::chrono::duration<double, std::milli>(t_solve_begin - t_prev_solve_end).count();
+                        ROS_INFO("[BATCH-INTERVAL] pass %d: interval since last batch solve %.3f ms, this solve %.3f ms",
+                                 pass_id, batch_interval_ms, d_init_solve_time * 1000.0);
+                    } else {
+                        ROS_INFO("[BATCH-INTERVAL] pass %d (first): this solve %.3f ms",
+                                 pass_id, d_init_solve_time * 1000.0);
+                    }
+                    t_prev_solve_end = t_solve_end;
+                    have_prev_solve = true;
                     current_g = dynamic_init->get_g();
                     current_v = dynamic_init->get_V_0();
                     if (batch_diagnostic) {
@@ -2225,9 +2290,81 @@ int main(int argc, char **argv)
                                                      std::chrono::steady_clock::now() - t_pass_begin).count());
                         batch_diagnostic.reset(); // 状态重置前先解绑观察者
                     }
+                    // [INIT-GATE] 写回前合理性校验
+                    if (init_gate_en) {
+                        const double gate_v0_norm = current_v.norm();
+                        const double gate_g_lin = dynamic_init->get_g();
+                        const double gate_g_ref = (init_gate_g_expected > 0.0) ? init_gate_g_expected : G_m_s2;
+                        const double gate_bg_norm = dynamic_init->get_gyro_bias().norm();
+                        bool gate_reject = false;
+                        const double gate_g_dev_pct = 100.0 * std::fabs(gate_g_lin - gate_g_ref) / gate_g_ref;
+                        const bool gate_v0_fail = (gate_v0_norm > init_gate_max_v0);
+                        const bool gate_g_fail  = (std::fabs(gate_g_lin - gate_g_ref) > init_gate_g_dev * gate_g_ref);
+                        const bool gate_bg_fail = (gate_bg_norm > init_gate_max_bg);
+                        ROS_WARN("[INIT-GATE] pass %d detail: |V0| %.3f / %.3f m/s [%s], linear |g| %.3f / %.3f m/s^2 (dev %.1f%% / %.1f%%) [%s], |bg| %.4f / %.4f rad/s [%s] -> %s",
+                                 pass_id, gate_v0_norm, init_gate_max_v0, gate_v0_fail ? "FAIL" : "OK",
+                                 gate_g_lin, gate_g_ref, gate_g_dev_pct, 100.0 * init_gate_g_dev,
+                                 gate_g_fail ? "FAIL" : "OK",
+                                 gate_bg_norm, init_gate_max_bg, gate_bg_fail ? "FAIL" : "OK",
+                                 (gate_v0_fail || gate_g_fail || gate_bg_fail) ? "REJECT" : "ACCEPT");
+                        if (gate_v0_fail) {
+                            gate_reject = true;
+                            ROS_WARN("[INIT-GATE] pass %d rejected: |V0| %.3f m/s exceeds %.3f (init_gate/max_v0_norm)",
+                                     pass_id, gate_v0_norm, init_gate_max_v0);
+                        } else if (std::fabs(gate_g_lin - gate_g_ref) > init_gate_g_dev * gate_g_ref) {
+                            gate_reject = true;
+                            ROS_WARN("[INIT-GATE] pass %d rejected: linear |g| %.3f vs expected %.3f, dev %.1f%% exceeds %.1f%% (init_gate/g_dev_ratio)",
+                                     pass_id, gate_g_lin, gate_g_ref,
+                                     100.0 * std::fabs(gate_g_lin - gate_g_ref) / gate_g_ref,
+                                     100.0 * init_gate_g_dev);
+                        } else if (gate_bg_fail) {
+                            gate_reject = true;
+                            ROS_WARN("[INIT-GATE] pass %d rejected: |bg| %.4f rad/s exceeds %.4f (init_gate/max_bg_norm)",
+                                     pass_id, gate_bg_norm, init_gate_max_bg);
+                        }
+                        if (gate_reject) {
+                            Li_D_init_iter_time << std::fixed << std::setprecision(6)
+                                << pass_id << " "
+                                << d_init_solve_time * 1000 << " "
+                                << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pass_begin).count() << " "
+                                << (Iteration_begin ? (current_v - Last_v).norm() : -1.0) << " "
+                                << 0 << endl;
+                            pass_id++;
+                            iteration_num++;
+                            if (iteration_num >= Iteration_NUM) {
+                                dynamic_init->dynamic_init_fished = true;
+                                if (t_init_phase_begin_set) {
+                                    const double init_phase_ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t_init_phase_begin).count();
+                                    ROS_WARN("[INIT-TIMER] dynamic init total: %.1f ms (batch solve: %.1f ms, passes: %d)",
+                                             init_phase_ms, sum_d_init_solve_time * 1000.0, pass_id);
+                                }
+                                if (!gate_any_accept) {
+                                    ROS_ERROR("[INIT-GATE] all %d iterations rejected, initialization aborted; state keeps pre-init state",
+                                              iteration_num);
+                                } else {
+                                    ROS_ERROR("[INIT-GATE] %d iterations reached limit, initialization aborted; state keeps last accepted write-back",
+                                              iteration_num);
+                                }
+                                if (diagnostics_enabled) {
+                                    drift_diag::context().handoff_time = Measures.lidar_end_time;
+                                    drift_diag::event("init_done", lidar_end_time, "gate_max_iter");
+                                }
+                            }
+                            // [GYRO-BIAS-ROLLBACK] 回滚陀螺偏置到本轮求解前的值, 防止拒绝轮的 delta_bg 污染后续 pass
+                            dynamic_init->set_gyro_bias(gyro_bias_backup);
+                            ROS_WARN("[GYRO-BIAS-ROLLBACK] pass %d: gyro_bias rolled back to (%.6f, %.6f, %.6f)",
+                                     pass_id, gyro_bias_backup(0), gyro_bias_backup(1), gyro_bias_backup(2));
+                            state.pos_end = Zero3d;
+                            state.rot_end = Eye3d;
+                            p_imu->Reset();
+                            ikdtree.delete_tree_nodes(&ikdtree.Root_Node);
+                            continue;
+                        }
+                    }
                     if(!Iteration_begin){
                         Iteration_begin = true;
-                        cout<<"kaishidiedai!!!"<<endl;
+                        ROS_INFO("[INIT] First batch accepted, iteration begins.");
                         Last_g = dynamic_init->get_g();
                         Last_v = dynamic_init->get_V_0();
                         state.bias_a = Zero3d;
@@ -2253,12 +2390,9 @@ int main(int argc, char **argv)
                         p_imu->Reset();
                         p_imu->set_gyr_cov(V3D(0.1, 0.1, 0.1));
                         p_imu->set_acc_cov(V3D(0.1, 0.1, 0.1));
-                        // p_imu->set_gyr_cov(V3D(0.01, 0.01, 0.01));
-                        // p_imu->set_acc_cov(V3D(5, 5, 5));
                         p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
                         p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
                         p_imu->imu_need_init_ = true;
-                        // flg_reset = true;
                         ikdtree.delete_tree_nodes(&ikdtree.Root_Node);
                         feats_undistort == NULL;
                         // 数据分析: 首轮(预处理+首次求解)迭代耗时, 首轮无上一轮解, delta_v 写-1
@@ -2272,9 +2406,15 @@ int main(int argc, char **argv)
                     }
                 }
                 // 采用相邻两次迭代初速度向量差范数作为收敛判据
-                if((current_v - Last_v).norm() < Iteration_v || iteration_num == Iteration_NUM)
+                if((current_v - Last_v).norm() < Iteration_v || iteration_num >= Iteration_NUM)
                 {
                     dynamic_init->dynamic_init_fished = true;
+                    if (t_init_phase_begin_set) {
+                        const double init_phase_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_init_phase_begin).count();
+                        ROS_WARN("[INIT-TIMER] dynamic init total: %.1f ms (batch solve: %.1f ms, passes: %d)",
+                                 init_phase_ms, sum_d_init_solve_time * 1000.0, pass_id);
+                    }
                     if (diagnostics_enabled) {
                         // 完成时钟统一: 后续 LIO 帧的 relative_time 以交接帧数据时间为锚
                         drift_diag::context().handoff_time = Measures.lidar_end_time;
@@ -2346,6 +2486,7 @@ int main(int argc, char **argv)
                     init_frame_flag = 2;
                 }else{
                     iteration_num ++;
+                    gate_any_accept = true;
                     Li_D_init_iter_time << std::fixed << std::setprecision(6)
                         << pass_id << " "
                         << d_init_solve_time * 1000 << " "
@@ -2375,14 +2516,11 @@ int main(int argc, char **argv)
                     p_imu->Reset();
                     p_imu->set_gyr_cov(V3D(0.1, 0.1, 0.1));
                     p_imu->set_acc_cov(V3D(0.1, 0.1, 0.1));
-                    // p_imu->set_gyr_cov(V3D(0.01, 0.01, 0.01));
-                    // p_imu->set_acc_cov(V3D(5, 5, 5));
                     p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
                     p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
                     p_imu->imu_need_init_ = true;
                     ikdtree.delete_tree_nodes(&ikdtree.Root_Node);
                     feats_undistort == NULL;
-                    // return 0;
                 }
             }
         }

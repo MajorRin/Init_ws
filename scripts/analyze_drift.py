@@ -1800,15 +1800,15 @@ def draw_lio_motion_rtk(ctx):
         ax.plot(*pos.T, '.-', ms=2, lw=.6, label=run.label)
     ax.set(xlabel="X (m)", ylabel="Y (m)", zlabel="Z (m)",
            title="Native world/IMU trajectory (NOT accuracy)")
-    _panel(ctx, 2, "Filter velocity (m/s; posterior, not batch initial speed)",
+    _panel(ctx, 3, "Filter velocity (m/s; posterior, not batch initial speed)",
            ["velocity"], ctx.pairs(ctx.lio_frames), motion=True, labels=list("XYZ"),
            grid=grid)
-    _panel(ctx, 3, "Filter speed vs RTK speed (m/s; magnitude only before ENU alignment)",
+    _panel(ctx, 4, "Filter speed vs RTK speed (m/s; magnitude only before ENU alignment)",
            ["speed", "rtk_speed"],
            [(run, [r for r in ctx.lio_frames(run)
                    if r.get("rtk_valid") and r.get("rtk_speed") is not None])
             for run in ctx.runs], grid=grid)
-    _panel(ctx, 4, "Adjacent position rate (m/s; not truth error)", ["position_rate_mps"],
+    _panel(ctx, 2, "Adjacent position rate (m/s; not truth error)", ["position_rate_mps"],
            ctx.pairs(ctx.lio_frames), motion=True, grid=grid)
     _panel(ctx, 5, "Quaternion-derived RPY (deg; Euler singularities)", ["rpy_deg"],
            ctx.pairs(ctx.lio_frames), motion=True, labels=list("RPY"), grid=grid)

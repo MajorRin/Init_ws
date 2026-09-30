@@ -100,6 +100,18 @@ void Dynamic_init::solve_Rot_bias_gyro() {
         A += tmp_A.transpose() * tmp_A;
         b += tmp_A.transpose() * tmp_b;
     }
+    // ==== [COND-NUM] 陀螺偏置法方程条件数诊断 ====
+    // A 为 3x3 对称半正定法方程矩阵, 条件数 = lambda_max/lambda_min.
+    // 每次调用(每个批解 pass)都打印, 不取平均; lambda_min<=0(秩亏)记 inf.
+    if (cond_num_en) {
+        Eigen::SelfAdjointEigenSolver<M3D> eig_solver(A);
+        const double eig_min = eig_solver.eigenvalues().minCoeff();
+        const double eig_max = eig_solver.eigenvalues().maxCoeff();
+        const double cond_num = (eig_min > 0.0) ? (eig_max / eig_min)
+                                                : std::numeric_limits<double>::infinity();
+        ROS_WARN("[COND-NUM] gyro_bias normal eq: cond=%.3e (eig_min=%.3e, eig_max=%.3e, pairs=%d)",
+                 cond_num, eig_min, eig_max, (int)system_state.size() - 1);
+    }
     auto decomposition = A.ldlt();
     const auto decomposition_status = decomposition.info();
     delta_bg = decomposition.solve(b);
@@ -269,6 +281,7 @@ void Dynamic_init::LinearAlignment(StatesGroup icp_state, VectorXd &x){
     }
     A = A * 1000.0;
     b = b * 1000.0;
+
     auto decomposition = A.ldlt();
     const auto decomposition_status = decomposition.info();
     x = decomposition.solve(b);
@@ -293,8 +306,8 @@ void Dynamic_init::LinearAlignment(StatesGroup icp_state, VectorXd &x){
     ROS_WARN_STREAM(" v_0     " <<  v_0.transpose());
     RefineGravity(icp_state, g, x);
     auto ba_ = x.segment<3>(n_state - 4);
-    cout<<"size: "<<x.size()<<endl;
     auto v_0_ = x.segment<3>(0);
+    cout<<"size: "<<x.size()<<endl;
     cout<<"---------------------------------"<<endl;
     ROS_WARN_STREAM(" result g     " << g.norm() << " " << g.transpose());
     ROS_WARN_STREAM(" ba     " <<  ba.transpose());
@@ -302,7 +315,9 @@ void Dynamic_init::LinearAlignment(StatesGroup icp_state, VectorXd &x){
 }
 
 
-void Dynamic_init::RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, VectorXd &x)
+void Dynamic_init::RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, VectorXd &x,
+                                             double rtk_speed_prior,
+                                             const Vector3d &prev_v0)
 {
     Vector3d g0 = g.normalized() * G.norm();
     Vector3d lx, ly;
@@ -311,13 +326,12 @@ void Dynamic_init::RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, V
     int n_state = all_frame_count * 3 + 2;
 
     MatrixXd A{n_state, n_state};
-    A.setZero();
     VectorXd b{n_state};
-    b.setZero();
-
 
     for(int k = 0; k < 4; k++)
     {
+        A.setZero();
+        b.setZero();
         MatrixXd lxly(3, 2);
         lxly = TangentBasis(g0);
         int i = 0;
@@ -362,6 +376,22 @@ void Dynamic_init::RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, V
         }
         A = A * 1000.0;
         b = b * 1000.0;
+
+        if (speed_prior_lambda > 0.0 && rtk_speed_prior > 0.0 && prev_v0.norm() > 0.5) {
+            Vector3d d = prev_v0.normalized();
+            A.block<3,3>(0, 0) += speed_prior_lambda * d * d.transpose();
+            b.segment<3>(0) += speed_prior_lambda * rtk_speed_prior * d;
+        }
+
+        if (cond_num_en) {
+            Eigen::SelfAdjointEigenSolver<MatrixXd> eig_solver(A);
+            const double eig_min = eig_solver.eigenvalues().minCoeff();
+            const double eig_max = eig_solver.eigenvalues().maxCoeff();
+            const double cond_num = (eig_min > 0.0) ? (eig_max / eig_min)
+                                                    : std::numeric_limits<double>::infinity();
+            ROS_WARN("[COND-NUM] gravity_refine normal eq (iter %d): cond=%.3e (eig_min=%.3e, eig_max=%.3e, dim=%d, pairs=%d)",
+                     k, cond_num, eig_min, eig_max, n_state, (int)system_state.size() - 1);
+        }
         auto decomposition = A.ldlt();
         const auto decomposition_status = decomposition.info();
         x = decomposition.solve(b);
@@ -380,7 +410,9 @@ void Dynamic_init::RefineGravity_withoutba(StatesGroup icp_state, Vector3d &g, V
     g = g0;
 }
 
-void Dynamic_init::LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x){
+void Dynamic_init::LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x,
+                                               double rtk_speed_prior,
+                                               const Vector3d &prev_v0){
     int all_pose_count = system_state.size();
     int n_state = all_pose_count * 3 + 3;
 
@@ -429,6 +461,25 @@ void Dynamic_init::LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x)
     }
     A = A * 1000.0;
     b = b * 1000.0;
+
+    if (speed_prior_lambda > 0.0 && rtk_speed_prior > 0.0 && prev_v0.norm() > 0.5) {
+        Vector3d d = prev_v0.normalized();
+        A.block<3,3>(0, 0) += speed_prior_lambda * d * d.transpose();
+        b.segment<3>(0) += speed_prior_lambda * rtk_speed_prior * d;
+        ROS_WARN("[SPEED-PRIOR] applied: rtk_speed=%.3f m/s, |prev_V0|=%.3f, lambda=%.1f, d=(%.3f,%.3f,%.3f)",
+                 rtk_speed_prior, prev_v0.norm(), speed_prior_lambda, d(0), d(1), d(2));
+    }
+
+    if (cond_num_en) {
+        Eigen::SelfAdjointEigenSolver<MatrixXd> eig_solver(A);
+        const double eig_min = eig_solver.eigenvalues().minCoeff();
+        const double eig_max = eig_solver.eigenvalues().maxCoeff();
+        const double cond_num = (eig_min > 0.0) ? (eig_max / eig_min)
+                                                : std::numeric_limits<double>::infinity();
+        ROS_WARN("[COND-NUM] linear_initial normal eq: cond=%.3e (eig_min=%.3e, eig_max=%.3e, dim=%d, pairs=%d)",
+                 cond_num, eig_min, eig_max, n_state, (int)system_state.size() - 1);
+    }
+
     auto decomposition = A.ldlt();
     const auto decomposition_status = decomposition.info();
     x = decomposition.solve(b);
@@ -450,7 +501,7 @@ void Dynamic_init::LinearAlignment_withoutba(StatesGroup icp_state, VectorXd &x)
     ROS_WARN_STREAM(" result g     " << g.norm() << " " << g.transpose());
     ROS_WARN_STREAM(" v_0     " <<  v_0.transpose());
     g_ = g.norm();
-    RefineGravity_withoutba(icp_state, g, x);
+    RefineGravity_withoutba(icp_state, g, x, rtk_speed_prior, prev_v0);
     auto v_0_ = x.segment<3>(0);
     cout<<"------------------------- After RefineGravity ---------------------------"<<endl;
     ROS_WARN_STREAM(" result g     " << g.norm() << " " << g.transpose());

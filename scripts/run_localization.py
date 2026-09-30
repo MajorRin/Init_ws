@@ -14,17 +14,17 @@ import sys
 import time
 import xmlrpc.client
 
-# ================= 用户配置区：通常只需修改这里 =================
+# ================= 用户配置区 =================
 # 命令行显式参数优先于这里的配置；布尔开关填写 True 或 False。
 CONFIG = {
     "bag": "/home/mao/rosbag/HZ_LiDAR_Dataset/AVIA/rosbag_all_19700101_080314.bag",
-    "start": 250.2,           # 从 bag 开头偏移多少秒开始回放
+    "start": 65.0,           # 从 bag 开头偏移多少秒开始回放
     "duration": 20.0,         # 雷达回放窗口长度，单位：秒（与分析窗口独立）
     "rate": 1.0,              # 回放倍率，1.0 为原速
     "drain_timeout": 120.0,   # 回放结束后等待雷达队列排空的最长秒数
     "init_grace": 30.0,       # bag 播完后允许初始化仍未收敛的额外挂钟秒数；超时强制收尾
     "imu_tail": 0.5,          # 窗口后仅补播 IMU 的秒数，0 表示禁用
-    "rviz": False,            # 是否打开 RViz 窗口
+    "rviz": False,            # 是否打开 rviz 窗口
     "record": False,          # 是否录制估计里程计和注册点云（可能较大）
     "analysis": True,         # 回放后自动分析；不生成图片
     "show_dashboard": True,   # 打开交互仪表盘；无桌面时仅终端摘要

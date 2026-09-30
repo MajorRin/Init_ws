@@ -72,6 +72,8 @@ class ImuProcess
   double first_lidar_time;
   int    lidar_type;
   bool   imu_en;
+  // [FIRST-FRAME-DESKEW] 首帧旋转去畸变开关(仅陀螺数据): false=旧行为(首帧 RAW 畸变点直接入图)
+  bool   first_frame_deskew_en = false;
   bool   LGO_MODE = true;
   bool   LO_MODE = true;
   bool   LIO_MODE = true;
@@ -146,6 +148,11 @@ void ImuProcess::Reset()
   // 修复: pass 切换缓存重放时, 残留的 last_lidar_end_time_ 会导致
   // propagation_and_undist 中 IMU 时间戳全部早于该值而整段 continue
   last_lidar_end_time_ = 0;
+  // 前向传播时间锚与首帧标志一并复位: 跨 pass 缓存重放(如闸门拒绝后)时
+  // 若残留, dt = pcl_beg_time - time_last_scan 为大负数且走错首帧分支;
+  // propagation_and_undist 不使用这两个变量, 对 LIO 分支无副作用
+  time_last_scan = 0;
+  b_first_frame_ = true;
 }
 
 void ImuProcess::set_extrinsic(const V3D &transl, const M3D &rot)
@@ -310,6 +317,69 @@ void ImuProcess::Forward_propagation_with_imu(const MeasureGroup &meas, StatesGr
         gyr_0.y() = meas.imu.back()->angular_velocity.y;
         gyr_0.z() = meas.imu.back()->angular_velocity.z;
         tmp_pre_integration = new IntegrationBase{Zero3d, Zero3d, Zero3d, Zero3d};
+
+        /*** [FIRST-FRAME-DESKEW] 首帧旋转去畸变(仅陀螺数据, 开关 first_frame_deskew_en) ***/
+        // 原实现首帧直接 return, RAW 畸变点全分辨率建种子图; 此处复用后续帧的
+        // GYR_pose 构建 + 反向传播去畸变, 但只做旋转补偿:
+        //   - 不做状态/协方差传播(state_inout 不被修改, 首帧位姿锚点仍为入口状态)
+        //   - 不改动 acc_0/gyr_0/last_imu_/last_lidar_end_time_/tmp_pre_integration 既有语义
+        //   - 时间下界用 pcl_beg_time(首帧无上一帧锚点); IMU 覆盖不全时积分自然截断
+        if (first_frame_deskew_en && !meas.imu.empty())
+        {
+            auto v_imu = meas.imu;
+            double imu_end_time = v_imu.back()->header.stamp.toSec();
+            GYR_pose.clear();
+            GYR_pose.push_back(imu_accumulative(0.0, angvel_last, state_inout.rot_end));
+            V3D angvel_avr = V3D::Zero();
+            M3D R_imu(state_inout.rot_end);
+            double dt_f = 0;
+            for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++)
+            {
+                auto &&head = *(it_imu);
+                auto &&tail = *(it_imu + 1);
+
+                if (tail->header.stamp.toSec() < pcl_beg_time)
+                    continue;
+
+                angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x),
+                    0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
+                    0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
+                if(head->header.stamp.toSec() < pcl_beg_time)
+                    dt_f = tail->header.stamp.toSec() - pcl_beg_time;
+                else
+                    dt_f = tail->header.stamp.toSec() - head->header.stamp.toSec();
+                R_imu = R_imu * Exp(angvel_avr, dt_f);
+                double &&offs_t = tail->header.stamp.toSec() - pcl_beg_time;
+                GYR_pose.push_back(imu_accumulative(offs_t, angvel_avr, R_imu));
+            }
+            /*** 帧末姿态: 与后续帧 rot_end 求法一致(IMU 覆盖超界回卷, 不足外推) ***/
+            double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
+            dt_f = note * (pcl_end_time - imu_end_time);
+            M3D rot_end_f = R_imu * Exp(V3D(note * angvel_avr), dt_f);
+            /*** 反向传播去畸变(与 else 分支一致, 但用局部 rot_end_f, 不写回 state) ***/
+            auto it_pcl = pcl_out.points.end() - 1;
+            for (auto it_kp = GYR_pose.end() - 1; it_kp != GYR_pose.begin(); it_kp--)
+            {
+                auto head = it_kp - 1;
+                R_imu = head->rot;
+                angvel_avr << VEC_FROM_ARRAY(head->angvel);
+                for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--) {
+                    dt_f = it_pcl->curvature / double(1000) - head->offset_time;
+                    /* Transform to the 'scan-end' IMU frame（I_k frame)*/
+                    M3D R_i(R_imu * Exp(angvel_avr, dt_f));
+                    V3D p_in(it_pcl->x, it_pcl->y, it_pcl->z);
+                    M3D R_jk = state_inout.offset_R_L_I.transpose() * rot_end_f.transpose() * R_i * state_inout.offset_R_L_I;
+                    V3D P_compensate = R_jk * p_in;
+                    /// save Undistorted points
+                    it_pcl->x = P_compensate(0);
+                    it_pcl->y = P_compensate(1);
+                    it_pcl->z = P_compensate(2);
+                    if (it_pcl == pcl_out.points.begin()) break;
+                }
+            }
+            ROS_INFO("[FIRST-FRAME-DESKEW] first frame: %d points rotation-deskewed (gyro only)",
+                     (int)pcl_out.points.size());
+        }
         return;
     }
     else
@@ -324,7 +394,7 @@ void ImuProcess::Forward_propagation_with_imu(const MeasureGroup &meas, StatesGr
         /*** Initialize IMU pose ***/
         GYR_pose.clear();
         GYR_pose.push_back(imu_accumulative(0.0, angvel_last, state_inout.rot_end));
-        V3D angvel_avr;
+        V3D angvel_avr = V3D::Zero();
         M3D R_imu(state_inout.rot_end);
         /*** forward propagation at each imu point ***/
         double dt = 0;
